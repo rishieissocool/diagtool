@@ -1,0 +1,32 @@
+# DiagTool settings — tune the test battery here.
+# All values have safe defaults in code (diag.diagnostics.DEFAULTS); anything
+# you set here overrides them. Units noted per key.
+
+# --- command streaming ---
+send_hz: 50.0            # how fast DiagTool streams commands to a robot (Hz)
+pose_max_age_s: 0.30     # ignore vision poses older than this when driving
+
+# --- motion thresholds (tuned to be above typical vision noise) ---
+onset_disp_mm: 12.0      # displacement that counts as "started moving"
+onset_angle_rad: 0.05    # rotation that counts as "started turning"
+moving_mm_s: 90.0        # speed above which the robot is "moving"
+stopped_mm_s: 35.0       # speed below which the robot is "stopped"
+vel_window_s: 0.22       # window for the instantaneous velocity estimate
+
+# --- test commanded magnitudes ---
+test_speed_ms: 0.30      # linear speed for latency/stop/speed tests (m/s)
+test_w_rads: 0.25        # angular speed for the rotation test (rad/s)
+
+# --- repetitions ---
+latency_trials: 6
+stop_trials: 5
+angular_trials: 4
+speed_passes: 4
+
+# --- timing / safety windows ---
+settle_s: 1.0            # stop-and-wait before/after each motion
+accel_settle_s: 0.5      # ignore this much accel before measuring steady speed
+stop_buffer_mm: 350.0    # stop a run this far before the safety margin
+max_run_s: 6.0           # hard cap on any single run
+health_window_s: 6.0     # how long the health tests observe
+poll_s: 0.004            # vision poll period inside loops
