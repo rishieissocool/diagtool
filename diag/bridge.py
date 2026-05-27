@@ -80,10 +80,36 @@ def ensure_on_path() -> None:
 
 # ── Lightweight imports (no protobuf / no Qt) ─────────────────────────────
 
+def local_config_path(filename: str = "ipconfig.yaml") -> Path:
+    """Path to DiagTool's own ipconfig (sibling of run_diag.py)."""
+    # diagtool/diag/bridge.py -> parents[1] = diagtool
+    return Path(__file__).resolve().parents[1] / filename
+
+
 def get_config(filename: str = "ipconfig.yaml"):
-    """TeamControl.utils.yaml_config.Config — robot IPs/ports + vision config."""
+    """TeamControl.utils.yaml_config.Config — robot IPs/ports + vision config.
+
+    Prefers DiagTool's own ``diagtool/ipconfig.yaml`` so the tool can run
+    standalone (and you can point it at the real robots without touching the
+    read-only TeamControl tree). Falls back to TeamControl's copy if no local
+    file exists. Either way the returned object is TeamControl's ``Config``, so
+    parsing is identical.
+    """
     ensure_on_path()
     from TeamControl.utils.yaml_config import Config
+
+    local = local_config_path(filename)
+    if local.is_file():
+        import yaml
+        try:
+            from yaml import CLoader as Loader
+        except ImportError:
+            from yaml import Loader
+        cfg = Config.__new__(Config)        # skip __init__'s fixed-path open
+        with open(local, "r") as f:
+            cfg.set_config(yaml.load(f, Loader))
+        return cfg
+
     return Config(config_filename=filename)
 
 
