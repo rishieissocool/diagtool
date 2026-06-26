@@ -416,6 +416,53 @@ def safe_zone_and_wall_distance():
                   min(lim.half_len, lim.half_wid))
 
 
+# A tighter arena: 300mm extra inset, 200mm brake zone.
+_ARENA_LIM = safety.Limits(
+    max_speed=1.0, max_w=1.8, half_len=2000.0, half_wid=1500.0,
+    robot_radius=90.0, field_margin=300.0, boundary_inset=300.0, brake_zone=200.0)
+
+
+@_test("safety")
+def arena_inset_shrinks_drive_zone():
+    lim = _ARENA_LIM
+    # arena = half - safe_margin(390) - inset(300)
+    assert approx(lim.arena_half_len, 2000.0 - 390.0 - 300.0)   # 1310
+    assert approx(lim.arena_half_wid, 1500.0 - 390.0 - 300.0)   # 810
+    assert safety.in_safe_zone(1300.0, 0.0, lim) is True
+    assert safety.in_safe_zone(1320.0, 0.0, lim) is False        # inside old margin,
+    assert safety.in_safe_zone(1320.0, 0.0, _SYNTH_LIM) is True  # but arena stops it
+
+
+@_test("safety")
+def arena_brakes_then_hard_stops_outward():
+    lim = _ARENA_LIM
+    ax = lim.arena_half_len                       # 1310
+    # well inside: full speed
+    vx, vy = safety.limit_to_arena(0.0, 0.0, 0.30, 0.0, lim)
+    assert approx(vx, 0.30) and approx(vy, 0.0)
+    # halfway into the 200mm brake zone -> ~half speed
+    vx, _ = safety.limit_to_arena(ax - 100.0, 0.0, 0.30, 0.0, lim)
+    assert approx(vx, 0.30 * 0.5, 1e-6)
+    # at/over the arena edge, pushing further out -> zero
+    vx, _ = safety.limit_to_arena(ax + 50.0, 0.0, 0.30, 0.0, lim)
+    assert vx == 0.0
+    # but inward (back toward centre) is never restricted
+    vx, _ = safety.limit_to_arena(ax + 50.0, 0.0, -0.30, 0.0, lim)
+    assert approx(vx, -0.30)
+
+
+@_test("safety")
+def arena_pipeline_blocks_outside_inset():
+    _need_movement()
+    lim = safety.limits(boundary_inset=500.0, brake_zone=400.0)
+    # a robot sitting beyond the arena, commanded straight at the near wall
+    x = lim.arena_half_len + 1.0
+    vx_r, vy_r, _, blocked = safety.safe_world_velocity((x, 0.0, 0.0),
+                                                        lim.max_speed, 0.0, 0.0, lim)
+    assert blocked is True
+    assert approx(math.hypot(vx_r, vy_r), 0.0, 1e-9)
+
+
 # ── safety against the REAL TeamControl constants (needs vendored tree) ────
 
 @_test("safety")
@@ -613,14 +660,19 @@ def commander_safe_zeroes_without_pose():
 
 @_test("commander")
 def commander_direct_sends_without_pose():
-    # direct mode mirrors the real dispatcher: command goes through with no pose
-    cmd, rec = _make_commander(_PoseVision(None))
+    # direct mode mirrors the real dispatcher: command goes through with no pose,
+    # but is capped to the slow blind speed (can't arena-guard what we can't see)
+    cmd, rec = _make_commander(_PoseVision(None))   # blind_speed default 0.25
     cmd.register(True, 1, "127.0.0.1", 50514)
-    cmd.set_velocity(True, 1, vx=0.30, vy=0.0, w=0.0, frame="body", safe=False)
+    cmd.set_velocity(True, 1, vx=0.20, vy=0.0, w=0.0, frame="body", safe=False)
     cmd._send_one(cmd._targets[(True, 1)])
     st = cmd.stats(True, 1)
     assert st["sends"] == 1 and st["zeroed_no_pose"] == 0
-    assert approx(st["last_sent"][0], 0.30, 1e-6), st["last_sent"]
+    assert approx(st["last_sent"][0], 0.20, 1e-6), st["last_sent"]    # under cap -> passes
+    # an over-cap command is throttled to the blind speed
+    cmd.set_velocity(True, 1, vx=0.90, vy=0.0, w=0.0, frame="body", safe=False)
+    cmd._send_one(cmd._targets[(True, 1)])
+    assert approx(cmd.stats(True, 1)["last_sent"][0], 0.25, 1e-6)
 
 
 @_test("commander")

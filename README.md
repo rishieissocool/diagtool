@@ -56,12 +56,24 @@ Full detail (with file/line refs and suggested fixes) is in every generated
 
 ## Safety — it will not hit walls
 
-Driving reuses TeamControl's own values:
+Every command is bounded to a conservative **drive arena** — the field minus
+TeamControl's keep-off margin (`FIELD_MARGIN + ROBOT_RADIUS`) minus an extra
+`boundary_inset_mm`. With the defaults the arena sits ~0.9 m inside every wall.
+
 * linear speed clamped to `MAX_SPEED`, angular to `MAX_W`,
-* `ball_nav.wall_brake` slowdown near boundaries,
-* a hard **outward-velocity guard** that removes any velocity pushing past the
-  safety margin (`FIELD_MARGIN + ROBOT_RADIUS`),
-* tests **stop before the margin** and **never drive a robot vision can't see**.
+* **braking ramp**: the outward velocity is scaled down over `brake_zone_mm`
+  before the arena edge, so a robot is already crawling when it reaches the
+  line — then any outward component is **hard-zeroed** at the boundary (it can
+  always still drive back toward centre),
+* this guard runs on the commander for **every** send — including manual jog and
+  direct mode — so a robot vision can see is *never* driven out of the arena,
+* tests also **stop before the arena edge**, cap travel at `max_travel_mm`, and
+  **never drive a robot vision can't see** (direct/jog without vision is capped
+  to a slow `direct_blind_speed_ms`),
+* the GUI field view draws the arena (orange dashed box) so you can see it.
+
+Make it tighter or looser in `diag_settings.yaml` (`boundary_inset_mm`,
+`brake_zone_mm`, `max_travel_mm`, `direct_blind_speed_ms`).
 
 ---
 

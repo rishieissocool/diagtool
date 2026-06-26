@@ -53,9 +53,15 @@ DEFAULTS = {
     "test_speed_ms": 0.30,      # commanded linear speed for motion tests
     "test_w_rads": 0.25,        # commanded angular speed for rotation test
     "accel_settle_s": 0.5,      # ignore this much accel before steady measure
-    "stop_buffer_mm": 350.0,    # stop a run this far before the safety margin
-    "max_run_s": 6.0,           # hard cap on any single run
+    "stop_buffer_mm": 350.0,    # stop a run this far before the arena edge
+    "max_run_s": 4.0,           # hard cap on any single run (s)
+    "max_travel_mm": 800.0,     # hard cap on how far a robot may travel per run
     "health_window_s": 6.0,     # observation window for health tests
+    # --- arena / wall safety (smaller = robots stay further from walls) ---
+    "boundary_inset_mm": 500.0,    # shrink the drive arena this far inside the
+                                   # keep-off margin (robots never leave it)
+    "brake_zone_mm": 400.0,        # decel ramp distance before the arena edge
+    "direct_blind_speed_ms": 0.25, # speed cap for direct/jog with no vision
 }
 
 
@@ -237,8 +243,8 @@ class Diagnostic:
 
     def _room_ahead(self, pose, ux, uy) -> float:
         x, y, _ = pose
-        xs = self.lim.half_len - self.lim.safe_margin
-        ys = self.lim.half_wid - self.lim.safe_margin
+        xs = self.lim.arena_half_len
+        ys = self.lim.arena_half_wid
         ts = []
         if ux > 1e-6:
             ts.append((xs - x) / ux)
@@ -536,8 +542,9 @@ class SpeedScaleDiagnostic(Diagnostic):
                 t_start = s_start.t_perf
                 p_start = (s_start.x, s_start.y, s_start.o)
 
-                # drive until near margin or time cap, sampling sent magnitude
+                # drive until near arena edge, travel cap, or time cap
                 end = time.perf_counter() + self.s("max_run_s")
+                max_travel = float(self.s("max_travel_mm"))
                 s_last = s_start
                 while time.perf_counter() < end:
                     self._check(stop)
@@ -545,6 +552,8 @@ class SpeedScaleDiagnostic(Diagnostic):
                     if s is not None:
                         s_last = s
                         if self._room_ahead(s.pose(), ux, uy) < self.s("stop_buffer_mm"):
+                            break
+                        if math.hypot(s.x - p_start[0], s.y - p_start[1]) >= max_travel:
                             break
                     ls = self.cmd.last_sent(robot.is_yellow, robot.robot_id)
                     if ls:

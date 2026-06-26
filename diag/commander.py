@@ -14,18 +14,20 @@ every send:
   4. records the *actually sent* velocity so diagnostics measure scale against
      what was transmitted, not merely what was requested.
 
-In *safe* mode (default) a robot whose pose is unknown is sent a zero command —
-it will never drive a robot it can't see (that's how you hit a wall) — but a
-brief vision dropout is bridged with the last good pose (`drive_grace`) so a
-single stale frame no longer kills the whole command stream. In *direct* mode
-(`safe=False`) the command is streamed straight to the robot's ip:port exactly
-like the real dispatcher, with no vision gate, for testing the command link
-itself. Every send is counted (sends / no-pose / safety / errors) so a "no
-motion" result can be traced to its cause.
+Whenever the robot's pose is known, EVERY command — safe or direct — is run
+through the arena brake + hard stop, so a robot we can see can never be driven
+out of bounds or into a wall. In *safe* mode (default) a robot whose pose is
+unknown is sent a zero command (it will never drive a robot it can't see) — but
+a brief vision dropout is bridged with the last good pose (`drive_grace`). In
+*direct* mode (`safe=False`) the command is streamed to the robot's ip:port like
+the real dispatcher even with no pose, for testing the command link — capped to
+a slow blind speed since it can't be arena-guarded. Every send is counted
+(sends / no-pose / safety / errors) so a "no motion" result can be traced.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -69,7 +71,8 @@ class Target:
 class Commander:
     def __init__(self, vision: VisionSource, sender_ip: str | None = None,
                  send_hz: float = 50.0, pose_max_age: float = 0.4,
-                 drive_grace: float = 0.5):
+                 drive_grace: float = 0.5, lim: safety.Limits | None = None,
+                 blind_speed: float = 0.25):
         Sender, RobotCommand = bridge.get_command_classes()
         self._RobotCommand = RobotCommand
         self._sender = Sender(device_ip=sender_ip) if sender_ip else Sender(device_ip=None)
@@ -79,7 +82,10 @@ class Commander:
         # keep driving on the last good pose for this long after vision goes
         # stale, instead of instantly zeroing the command stream
         self._drive_grace = max(0.0, float(drive_grace))
-        self._lim = safety.limits()
+        # speed cap for direct sends when we have NO pose (can't arena-guard)
+        self._blind_speed = max(0.0, float(blind_speed))
+        # arena-aware limits (shared with the engine/diagnostics)
+        self._lim = lim or safety.limits()
 
         self._targets: dict[tuple[bool, int], Target] = {}
         self._lock = threading.Lock()
@@ -230,12 +236,10 @@ class Commander:
         reason = None
         blocked = False
 
-        if not t.safe:
-            # DIRECT mode — send the command straight to the robot exactly like
-            # the real dispatcher (no vision gate, no wall guard). Magnitude is
-            # still capped to MAX_SPEED / MAX_W so a typo can't launch it.
-            vx_r, vy_r, w = safety.clamp_velocity(t.vx, t.vy, t.w, self._lim)
-        elif drive_pose is not None:
+        if drive_pose is not None:
+            # Vision available -> ALWAYS apply the arena brake + hard stop, even
+            # in direct/jog mode, so a robot we can see is never driven out of
+            # bounds or into a wall.
             if t.frame == "body":
                 vx_r, vy_r, w, blocked = safety.safe_body_velocity(
                     drive_pose, t.vx, t.vy, t.w, self._lim)
@@ -244,6 +248,14 @@ class Commander:
                     drive_pose, t.vx, t.vy, t.w, self._lim)
             if blocked and want_motion:
                 reason = "safety"
+        elif not t.safe:
+            # DIRECT mode, no pose: stream the command (comms/link test) but cap
+            # it to a slow blind speed — we can't arena-guard what we can't see.
+            vx_r, vy_r, w = safety.clamp_velocity(t.vx, t.vy, t.w, self._lim)
+            spd = math.hypot(vx_r, vy_r)
+            if self._blind_speed > 0.0 and spd > self._blind_speed:
+                s = self._blind_speed / spd
+                vx_r, vy_r = vx_r * s, vy_r * s
         else:
             # Safe mode with no usable pose -> never drive a robot we can't see.
             vx_r = vy_r = w = 0.0

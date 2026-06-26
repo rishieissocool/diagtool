@@ -43,14 +43,26 @@ class Limits:
     half_wid: float         # mm   (field half width,  +/-y)
     robot_radius: float     # mm
     field_margin: float     # mm   (TeamControl's keep-off-walls margin)
+    boundary_inset: float = 0.0   # mm extra inset -> a tighter "arena"
+    brake_zone: float = 400.0     # mm before the arena edge where braking starts
 
     @property
     def safe_margin(self) -> float:
         """Distance from a wall (to robot *centre*) we never knowingly cross."""
         return self.field_margin + self.robot_radius
 
+    @property
+    def arena_half_len(self) -> float:
+        """+/-x half-extent of the drive arena (robots are kept inside this)."""
+        return max(0.0, self.half_len - self.safe_margin - self.boundary_inset)
 
-def limits() -> Limits:
+    @property
+    def arena_half_wid(self) -> float:
+        """+/-y half-extent of the drive arena."""
+        return max(0.0, self.half_wid - self.safe_margin - self.boundary_inset)
+
+
+def limits(boundary_inset: float = 0.0, brake_zone: float = 400.0) -> Limits:
     c = _consts()
     half_len, half_wid = bridge.get_field_geometry()
     return Limits(
@@ -60,6 +72,8 @@ def limits() -> Limits:
         half_wid=half_wid,
         robot_radius=float(c.ROBOT_RADIUS),
         field_margin=float(c.FIELD_MARGIN),
+        boundary_inset=max(0.0, float(boundary_inset)),
+        brake_zone=max(0.0, float(brake_zone)),
     )
 
 
@@ -87,16 +101,50 @@ def nearest_wall_dist(x: float, y: float, lim: Limits | None = None) -> float:
 
 def in_safe_zone(x: float, y: float, lim: Limits | None = None,
                  extra: float = 0.0) -> bool:
-    """True if (x, y) is inside the field minus the safety margin."""
+    """True if (x, y) is inside the drive arena (field minus margin minus inset)."""
     lim = lim or limits()
-    m = lim.safe_margin + extra
-    return abs(x) <= (lim.half_len - m) and abs(y) <= (lim.half_wid - m)
+    return abs(x) <= (lim.arena_half_len - extra) and \
+        abs(y) <= (lim.arena_half_wid - extra)
 
 
 def wall_brake(x: float, y: float, vx: float, vy: float) -> tuple[float, float]:
     """Isotropic slow-down near walls — TeamControl's ball_nav.wall_brake."""
     _consts()
     return _NAV.wall_brake(x, y, vx, vy)
+
+
+def _brake_axis(p: float, v: float, bound: float, brake: float) -> float:
+    """Ramp the *outward* velocity on one axis to 0 as the robot nears +/-bound.
+
+    Inward motion is never touched (the robot can always head back to centre).
+    Beyond the boundary the outward component is fully removed (hard stop).
+    """
+    if v > 0:
+        room = bound - p
+    elif v < 0:
+        room = bound + p
+    else:
+        return v
+    if room <= 0.0:
+        return 0.0                       # at/over the arena edge: no outward motion
+    if brake > 0.0 and room < brake:
+        return v * (room / brake)        # linear decel into the boundary
+    return v
+
+
+def limit_to_arena(x: float, y: float, vx_w: float, vy_w: float,
+                   lim: Limits | None = None) -> tuple[float, float]:
+    """Brake + hard-stop a WORLD-frame velocity at the (tighter) arena edge.
+
+    Replaces the old instant outward-guard: instead of only zeroing velocity at
+    the margin (after which the robot still coasts), this ramps speed down over
+    `brake_zone` mm so the robot is already crawling when it reaches the arena
+    line, and zeroes any outward component at/past it.
+    """
+    lim = lim or limits()
+    vx_w = _brake_axis(x, vx_w, lim.arena_half_len, lim.brake_zone)
+    vy_w = _brake_axis(y, vy_w, lim.arena_half_wid, lim.brake_zone)
+    return vx_w, vy_w
 
 
 def guard_outward_world(x: float, y: float, vx_w: float, vy_w: float,
@@ -125,23 +173,26 @@ def safe_world_velocity(pose, vx_w: float, vy_w: float, w: float,
     """Full safety pipeline for a WORLD-frame velocity intent.
 
     pose = (x, y, theta). Returns (vx_robot, vy_robot, w, blocked) where the
-    linear velocity has been: outward-guarded, magnitude-clamped, wall-braked,
-    then rotated into the robot body frame (omni-drive). `blocked` is True if
-    the guard removed velocity the caller asked for (i.e. we're at a wall).
+    linear velocity has been: magnitude-clamped, then braked + hard-stopped at
+    the arena boundary (decel ramp over brake_zone), then rotated into the robot
+    body frame (omni-drive). `blocked` is True when the arena guard removed a
+    meaningful chunk of the command (i.e. we're at / heading into a wall).
     """
     lim = lim or limits()
     x, y, theta = pose
 
-    gx, gy = guard_outward_world(x, y, vx_w, vy_w, lim)
-    blocked = (gx != vx_w) or (gy != vy_w)
-
-    gx, gy, w = clamp_velocity(gx, gy, w, lim)
-    gx, gy = wall_brake(x, y, gx, gy)
+    # cap magnitude / angular, then brake + hard-stop at the arena boundary
+    gx, gy, w = clamp_velocity(vx_w, vy_w, w, lim)
+    in_mag = math.hypot(gx, gy)
+    bx, by = limit_to_arena(x, y, gx, gy, lim)
+    out_mag = math.hypot(bx, by)
+    # "blocked" = the arena guard removed a meaningful chunk of a real command
+    blocked = in_mag > 1e-6 and out_mag < 0.5 * in_mag
 
     # World -> robot body frame (rotate by -theta).
     cos_t, sin_t = math.cos(theta), math.sin(theta)
-    vx_r = gx * cos_t + gy * sin_t
-    vy_r = -gx * sin_t + gy * cos_t
+    vx_r = bx * cos_t + by * sin_t
+    vy_r = -bx * sin_t + by * cos_t
     return vx_r, vy_r, w, blocked
 
 

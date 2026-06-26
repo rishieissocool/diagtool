@@ -86,7 +86,11 @@ class Engine:
     def __init__(self, settings: dict | None = None):
         self.config = bridge.get_config()
         self.settings = settings or load_settings()
-        self.lim = safety.limits()
+        self.lim = safety.limits(
+            boundary_inset=float(self.settings.get("boundary_inset_mm",
+                                                   DEFAULTS["boundary_inset_mm"])),
+            brake_zone=float(self.settings.get("brake_zone_mm",
+                                               DEFAULTS["brake_zone_mm"])))
 
         self.vision = VisionSource(port=int(self.config.vision[1]))
         self.telemetry = TelemetrySource(self.config)
@@ -211,6 +215,9 @@ class Engine:
                                                  DEFAULTS["pose_max_age_s"])),
             drive_grace=float(self.settings.get("drive_grace_s",
                                                 DEFAULTS["drive_grace_s"])),
+            lim=self.lim,
+            blind_speed=float(self.settings.get("direct_blind_speed_ms",
+                                                DEFAULTS["direct_blind_speed_ms"])),
         )
         # register every robot so the commander can drive any of them
         for r in self.robots():

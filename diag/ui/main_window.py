@@ -351,8 +351,8 @@ class MainWindow(QMainWindow):
     def _jog(self, fx: float, fy: float, fw: float):
         """Plainly drive the selected robot for a short pulse, then auto-stop.
 
-        Uses direct send (no vision gate / wall guard) so it moves even when
-        vision is flaky — keep clear space around the robot.
+        Direct send, so it moves even when vision is flaky — but while vision
+        CAN see the robot it is still arena-braked and cannot leave the field.
         """
         if self._thread is not None:
             return                                   # a test job is running
@@ -361,7 +361,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Select a robot",
                                     "Pick a robot in the table first.")
             return
-        speed, wspeed, dur_ms = 0.20, 0.6, 500
+        speed, wspeed, dur_ms = 0.15, 0.5, 400
         vx, vy, w = fx * speed, fy * speed, fw * wspeed
         self.engine.commander.set_velocity(
             r.is_yellow, r.robot_id, vx=vx, vy=vy, w=w, frame="body", safe=False)

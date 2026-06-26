@@ -17,6 +17,7 @@ import math
 _BG = QColor("#0b3d0b")
 _LINE = QColor("#cfe8cf")
 _SAFE = QColor("#e0b341")
+_ARENA = QColor("#ff8c42")
 _YELLOW = QColor("#e8d44d")
 _BLUE = QColor("#4d8ce8")
 _SEL = QColor("#ff5555")
@@ -84,6 +85,17 @@ class FieldView(QWidget):
         pen = QPen(_SAFE, 1, Qt.DashLine)
         p.setPen(pen)
         p.drawRect(QRectF(st, sb))
+
+        # drive arena — the tighter boundary the robot is actively kept inside
+        ax = getattr(lim, "arena_half_len", None)
+        ay = getattr(lim, "arena_half_wid", None)
+        if ax and ay:
+            at = to_px(-ax, ay)
+            ab = to_px(ax, -ay)
+            p.setPen(QPen(_ARENA, 2, Qt.DashLine))
+            p.drawRect(QRectF(at, ab))
+            p.setPen(QPen(_ARENA))
+            p.drawText(QPointF(at.x() + 4, at.y() + 14), "arena")
 
         # robots
         rr = max(lim.robot_radius * scale, 6)

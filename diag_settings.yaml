@@ -33,7 +33,16 @@ speed_passes: 4
 # --- timing / safety windows ---
 settle_s: 1.0            # stop-and-wait before/after each motion
 accel_settle_s: 0.5      # ignore this much accel before measuring steady speed
-stop_buffer_mm: 350.0    # stop a run this far before the safety margin
-max_run_s: 6.0           # hard cap on any single run
+stop_buffer_mm: 350.0    # stop a run this far before the arena edge
+max_run_s: 4.0           # hard cap on any single run (s)
+max_travel_mm: 800.0     # hard cap: stop a run after the robot moves this far
 health_window_s: 6.0     # how long the health tests observe
 poll_s: 0.004            # vision poll period inside loops
+
+# --- arena / wall safety (make tests stay well away from the walls) ---
+# The drive arena is the field minus the keep-off margin minus this inset.
+# Robots are actively braked to a stop at the arena edge and never cross it.
+# Bigger inset / brake_zone = safer (robots stay further in, slow down sooner).
+boundary_inset_mm: 500.0     # shrink the arena this far inside the keep-off margin
+brake_zone_mm: 400.0         # start decelerating this far before the arena edge
+direct_blind_speed_ms: 0.25  # speed cap for direct/jog moves with NO vision
