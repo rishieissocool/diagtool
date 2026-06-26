@@ -95,18 +95,45 @@ points at the real `192.168.1.x` addresses, not `127.0.0.1`.)
 ```
 python run_diag.py
 ```
-Pick a robot, click a diagnostic (or **Run Full Sweep**), watch the field view,
-log and live vision/telemetry health. **STOP** aborts immediately.
+Pick a robot, then:
+* **Manual jog** — Forward / Back / Left / Right / Turn buttons drive the
+  selected robot in short 0.5 s pulses (direct send, body frame) so you can
+  *see* it move and confirm the link before measuring anything. **■ STOP** halts
+  the jog.
+* **▶ Probe + Run All Tests** — one click: streams a heartbeat and checks the
+  robot is reachable (probe verdict shown on top of the report), then runs the
+  whole battery on that robot.
+* Individual diagnostic buttons, **Run Full Sweep** (all real robots), and the
+  red **STOP** which aborts immediately.
+
+Duplicate-IP robots are flagged in the table (`⚠ DUP`) and the log.
 
 ### CLI (headless / over SSH)
 ```
-python run_diag.py --cli list                       # list robots
+python run_diag.py --cli list                       # list robots (+ IP-conflict warnings)
 python run_diag.py --cli status                     # live vision/telemetry
+python run_diag.py --cli probe --robot B1           # is the robot actually reachable?
 python run_diag.py --cli health --robot Y0
 python run_diag.py --cli test command_latency --robot Y0
 python run_diag.py --cli sweep --real               # full battery, all real robots
 python run_diag.py --cli sweep --robots Y0,Y1 --tests command_latency,speed_scale
 ```
+
+**`probe`** is the first thing to run when a robot won't move. It streams a
+harmless zero heartbeat straight to the robot's `ip:port` (add `--move 0.2` for a
+gentle nudge) and listens, then gives a verdict:
+
+* **SILENT** — PC sent commands with no errors but nothing replied → robot off,
+  RobotFramework not running, or wrong IP/port in `ipconfig.yaml`.
+* **ALIVE but did not move** — telemetry *is* coming back, so the robot receives
+  commands; motion is frozen on the robot (SAFE-mode wheel-math / `W_LIMIT`, or
+  wheel units). Fix RobotFramework, not DiagTool.
+* **SEND FAILED** — the OS rejected the packets: the IP is wrong/unroutable.
+
+> **One robot per IP.** If two labels share an IP (e.g. `B1` and `Y3` both on
+> `192.168.1.4`), commands for one are acted on by whichever robot answers there
+> — which looks exactly like "no motion / no telemetry". `list`, the GUI table,
+> and every report flag this; give each robot a unique address.
 
 Test names: `vision_health`, `telemetry_health`, `command_latency`,
 `stop_latency`, `speed_scale`, `angular`.

@@ -57,6 +57,34 @@ def _cmd_list(engine, args):
     for r in engine.robots():
         _log(f"{r.label:6} {'yellow' if r.is_yellow else 'blue':7} "
              f"{r.robot_id:<3} {r.ip:16} {r.port:<6} {'yes' if r.is_real else 'no'}")
+    _warn_conflicts(engine)
+    return 0
+
+
+def _warn_conflicts(engine, robots=None):
+    conflicts = engine.ip_conflicts()
+    if robots is not None:
+        wanted = {r.ip for r in robots}
+        conflicts = {ip: lbls for ip, lbls in conflicts.items() if ip in wanted}
+    for ip, labels in conflicts.items():
+        _log(f"[!] {ip} is shared by {', '.join(labels)} — commands for one go "
+             "to whichever robot answers at that IP (or nothing). Give each robot "
+             "a unique IP in ipconfig.yaml.")
+
+
+def _cmd_probe(engine, args):
+    r = engine.find_robot(args.robot) if args.robot else None
+    if r is None:
+        _log(f"probe needs a valid --robot LABEL (use 'list'). Got: {args.robot!r}")
+        return 2
+    move = float(args.move) if args.move else 0.0
+    if move > 0:
+        _log(f"[probe] direct nudge at {move:.2f} m/s — clear space around {r.label}.")
+    res = engine.probe_robot(r, seconds=args.seconds, move_speed=move, log=_log)
+    _log("")
+    _log(f"probe {r.label} @ {res['ip']}:{res['port']} (id={res['robot_id']}): "
+         f"telemetry={res['telemetry_packets']} pkts, sent={res['commands_sent']}, "
+         f"send_err={res['send_errors']}, vision_motion={res['vision_motion_mm']}mm")
     return 0
 
 
@@ -89,6 +117,7 @@ def _run_tests(engine, robots, test_names, args):
     if not robots:
         _log("No robots selected. Use --robot Y0, --robots Y0,Y1, or --real.")
         return 2
+    _warn_conflicts(engine, robots)
     ev, stop = _make_stop()
 
     def progress(frac, text=""):
@@ -139,6 +168,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("status", help="show live vision/telemetry status")
     sp.add_argument("--seconds", type=float, default=8.0)
+
+    pp = sub.add_parser("probe",
+                        help="is a robot actually reachable? (heartbeat + listen)")
+    pp.add_argument("--robot", required=True, help="robot label, e.g. B1")
+    pp.add_argument("--seconds", type=float, default=5.0)
+    pp.add_argument("--move", type=float, default=0.0,
+                    help="optional body-forward nudge speed m/s (default 0 = no motion)")
 
     for name in ("health",):
         hp = sub.add_parser(name, help="vision + telemetry health")
@@ -210,6 +246,7 @@ def main(argv=None) -> int:
     dispatch = {
         "list": _cmd_list,
         "status": _cmd_status,
+        "probe": _cmd_probe,
         "health": _cmd_health,
         "test": _cmd_test,
         "sweep": _cmd_sweep,

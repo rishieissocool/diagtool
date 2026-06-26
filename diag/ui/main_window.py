@@ -63,6 +63,18 @@ class Worker(QObject):
                     include_net=self.job.get("include_net", False),
                     stop=self._stop.is_set)
                 self.sig_done.emit({"kind": "selftest", "report": rep})
+            elif self.job["kind"] == "testall":
+                robot = self.job["robot"]
+                # 1) wake/prove the link first — stream a heartbeat and listen
+                log(f"== Reachability probe :: {robot.label} ==")
+                probe = self.engine.probe_robot(robot, seconds=2.0,
+                                                move_speed=0.0, log=log)
+                # 2) then run the whole battery on this robot
+                tests = [d.name for d in ALL_DIAGNOSTICS]
+                rep = self.engine.run_sweep(
+                    [robot], tests, log=log, progress=prog,
+                    stop=self._stop.is_set)
+                self.sig_done.emit({"kind": "sweep", "report": rep, "probe": probe})
             else:
                 rep = self.engine.run_sweep(
                     self.job["robots"], self.job["tests"],
@@ -84,14 +96,25 @@ class MainWindow(QMainWindow):
         self._worker: Worker | None = None
         self._robots = engine.robots()
         self._row_by_label = {}
+        self._jog_target = None
 
         self._build_ui()
         self.engine.start()
+
+        for ip, labels in self.engine.ip_conflicts().items():
+            self._append_log(f"[!] CONFIG: {ip} is shared by {', '.join(labels)} "
+                             "— commands for one go to whichever robot answers at "
+                             "that IP. Fix ipconfig.yaml.")
 
         self._timer = QTimer(self)
         self._timer.setInterval(250)
         self._timer.timeout.connect(self._refresh_status)
         self._timer.start()
+
+        # auto-stop timer for manual jog pulses
+        self._jog_timer = QTimer(self)
+        self._jog_timer.setSingleShot(True)
+        self._jog_timer.timeout.connect(self._jog_stop)
 
     # -- UI --
     def _build_ui(self):
@@ -123,12 +146,19 @@ class MainWindow(QMainWindow):
         self.tbl.setSelectionBehavior(QTableWidget.SelectRows)
         self.tbl.setSelectionMode(QTableWidget.SingleSelection)
         self.tbl.itemSelectionChanged.connect(self._on_select)
+        conflicts = self.engine.ip_conflicts()
         for r in self._robots:
             row = self.tbl.rowCount()
             self.tbl.insertRow(row)
             self._row_by_label[r.label] = row
             self.tbl.setItem(row, 0, QTableWidgetItem(r.label))
-            self.tbl.setItem(row, 1, QTableWidgetItem(r.ip))
+            ip_item = QTableWidgetItem(
+                r.ip + ("  ⚠ DUP" if r.ip in conflicts else ""))
+            if r.ip in conflicts:
+                ip_item.setToolTip(
+                    f"{r.ip} is shared by {', '.join(conflicts[r.ip])} — give "
+                    "each robot a unique IP in ipconfig.yaml.")
+            self.tbl.setItem(row, 1, ip_item)
             self.tbl.setItem(row, 2, QTableWidgetItem("yes" if r.is_real else "no"))
             self.tbl.setItem(row, 3, QTableWidgetItem("—"))
             self.tbl.setItem(row, 4, QTableWidgetItem("—"))
@@ -150,12 +180,38 @@ class MainWindow(QMainWindow):
             self._test_btns.append(b)
         rl.addWidget(ctrl)
 
+        # -- manual jog: plainly drive the robot a little, to see it move --
+        jog = QGroupBox("Manual jog — selected robot · 0.5 s pulse · body frame")
+        jg = QGridLayout(jog)
+        self._jog_btns = []
+
+        def _jog_btn(label, fx, fy, fw, row, col, tip):
+            b = QPushButton(label)
+            b.setToolTip(tip)
+            b.clicked.connect(
+                lambda _=False, a=fx, c=fy, d=fw: self._jog(a, c, d))
+            jg.addWidget(b, row, col)
+            self._jog_btns.append(b)
+
+        _jog_btn("↑ Forward", 1, 0, 0, 0, 1, "drive forward (body +X)")
+        _jog_btn("← Left", 0, 1, 0, 1, 0, "strafe left (body +Y)")
+        _jog_btn("↺ Turn", 0, 0, 1, 1, 1, "rotate counter-clockwise")
+        _jog_btn("Turn ↻", 0, 0, -1, 1, 2, "rotate clockwise")
+        _jog_btn("Right →", 0, -1, 0, 1, 3, "strafe right (body −Y)")
+        _jog_btn("↓ Back", -1, 0, 0, 2, 1, "drive backward (body −X)")
+        bstop = QPushButton("■ STOP")
+        bstop.setStyleSheet("background:#e05050; color:white; font-weight:bold;")
+        bstop.clicked.connect(self._jog_stop)
+        jg.addWidget(bstop, 2, 3)
+        rl.addWidget(jog)
+
         testall_row = QHBoxLayout()
-        self.btn_testall = QPushButton("▶ Run All Tests (selected robot)")
+        self.btn_testall = QPushButton("▶ Probe + Run All Tests (selected robot)")
         self.btn_testall.setStyleSheet("font-weight:bold; padding:6px;")
         self.btn_testall.setToolTip(
-            "Run the full diagnostic battery on the highlighted robot and "
-            "write a report — one click for everything.")
+            "One click: first stream a heartbeat and check the robot is "
+            "reachable (probe), then run the whole diagnostic battery on the "
+            "highlighted robot and write a report.")
         self.btn_testall.clicked.connect(self._run_test_all)
         testall_row.addWidget(self.btn_testall, 1)
         rl.addLayout(testall_row)
@@ -216,6 +272,8 @@ class MainWindow(QMainWindow):
     def _busy(self, busy: bool):
         for b in self._test_btns:
             b.setEnabled(not busy)
+        for b in self._jog_btns:
+            b.setEnabled(not busy)
         self.btn_testall.setEnabled(not busy)
         self.btn_sweep.setEnabled(not busy)
         self.btn_selftest.setEnabled(not busy)
@@ -255,7 +313,12 @@ class MainWindow(QMainWindow):
         self.lbl_action.setText("done")
         if payload.get("kind") == "sweep":
             rep = payload.get("report", {})
-            self.summary.setPlainText(render_text(rep))
+            txt = render_text(rep)
+            probe = payload.get("probe")
+            if probe:
+                txt = (f"PROBE {probe.get('robot')} @ {probe.get('ip')}:"
+                       f"{probe.get('port')} — {probe.get('verdict', '')}\n\n" + txt)
+            self.summary.setPlainText(txt)
         elif payload.get("kind") == "test":
             self.summary.setPlainText(
                 f"{payload['robot']} :: {payload['name']}\n"
@@ -281,9 +344,37 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Select a robot",
                                     "Pick a robot in the table first.")
             return
-        tests = [d.name for d in ALL_DIAGNOSTICS]
-        self._append_log(f"Running all {len(tests)} tests on {r.label}...")
-        self._start_worker({"kind": "sweep", "robots": [r], "tests": tests})
+        self._append_log(f"One-click: probe + full battery on {r.label}...")
+        self._start_worker({"kind": "testall", "robot": r})
+
+    # -- manual jog --
+    def _jog(self, fx: float, fy: float, fw: float):
+        """Plainly drive the selected robot for a short pulse, then auto-stop.
+
+        Uses direct send (no vision gate / wall guard) so it moves even when
+        vision is flaky — keep clear space around the robot.
+        """
+        if self._thread is not None:
+            return                                   # a test job is running
+        r = self._selected_robot()
+        if r is None:
+            QMessageBox.information(self, "Select a robot",
+                                    "Pick a robot in the table first.")
+            return
+        speed, wspeed, dur_ms = 0.20, 0.6, 500
+        vx, vy, w = fx * speed, fy * speed, fw * wspeed
+        self.engine.commander.set_velocity(
+            r.is_yellow, r.robot_id, vx=vx, vy=vy, w=w, frame="body", safe=False)
+        self._jog_target = r
+        self._append_log(
+            f"jog {r.label}: vx={vx:.2f} vy={vy:.2f} m/s  w={w:.2f} rad/s  ({dur_ms} ms)")
+        self._jog_timer.start(dur_ms)
+
+    def _jog_stop(self):
+        self._jog_timer.stop()
+        r = self._jog_target or self._selected_robot()
+        if r is not None and self.engine.commander is not None:
+            self.engine.commander.stop_robot(r.is_yellow, r.robot_id)
 
     def _run_sweep(self):
         robots = self.engine.robots(real_only=True)
@@ -349,6 +440,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev):
         self._timer.stop()
+        self._jog_timer.stop()
         if self._worker:
             self._worker.stop()
         if self._thread:

@@ -229,6 +229,11 @@ def render_text(report: dict) -> str:
     add(f"generated : {report['meta'].get('generated')}")
     if report["meta"].get("robots"):
         add(f"robots    : {', '.join(report['meta']['robots'])}")
+    conflicts = report["meta"].get("ip_conflicts") or {}
+    for ip, labels in conflicts.items():
+        add(f"  [!] CONFIG: {ip} is shared by {', '.join(labels)} — give each "
+            "robot a unique IP in ipconfig.yaml (a shared IP looks exactly like "
+            "'no motion / no telemetry').")
     add("")
 
     env = report["environment"]

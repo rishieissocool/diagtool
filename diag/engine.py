@@ -15,6 +15,7 @@ callbacks let either front-end stream output and abort.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,21 @@ class RobotInfo:
 
     def ref(self) -> RobotRef:
         return RobotRef(self.is_yellow, self.robot_id, self.ip, self.port)
+
+
+def ip_conflicts(robots) -> dict:
+    """Real robots that share an IP -> {ip: [labels]}.
+
+    Two robots on one address is a config bug: commands for one label are
+    delivered to whatever single robot actually answers at that IP (or to
+    nothing), which looks exactly like "no motion / no telemetry". Loopback
+    (127.x) is ignored — sharing it is normal for sim entries.
+    """
+    by_ip: dict[str, list[str]] = {}
+    for r in robots:
+        if getattr(r, "is_real", False):
+            by_ip.setdefault(r.ip, []).append(r.label)
+    return {ip: sorted(set(lbls)) for ip, lbls in by_ip.items() if len(set(lbls)) > 1}
 
 
 def load_settings() -> dict:
@@ -99,6 +115,87 @@ class Engine:
             if r.label.lower() == label.lower():
                 return r
         return None
+
+    def ip_conflicts(self) -> dict:
+        """Real robots sharing an IP (see module-level ip_conflicts())."""
+        return ip_conflicts(self.robots())
+
+    def probe_robot(self, robot: RobotInfo, seconds: float = 5.0,
+                    move_speed: float = 0.0, log=None) -> dict:
+        """Is the robot actually there? Stream a direct command and listen.
+
+        Sends a harmless zero heartbeat (or a gentle body-forward nudge if
+        move_speed > 0) straight to the robot's ip:port — exactly like the real
+        dispatcher — and watches for (a) telemetry coming back and (b) vision
+        motion. Separates "wrong IP / robot off" (silent) from "reachable but
+        frozen" (replies but won't move, e.g. SAFE-mode wheel-math).
+        """
+        log = log or (lambda *_: None)
+        if not self._started:
+            self.start()
+        is_y, rid = robot.is_yellow, robot.robot_id
+
+        conflict = self.ip_conflicts().get(robot.ip)
+        if conflict:
+            log(f"  [!] {robot.ip} is shared by {', '.join(conflict)} — a "
+                "command for one of them is acted on by whichever robot answers "
+                "at that IP. Give each robot a unique IP in ipconfig.yaml.")
+
+        self.commander.reset_stats(is_y, rid)
+        pkt0 = self.telemetry.status().get("packets", 0)
+        s0 = self.vision.get_pose_sample(is_y, rid, max_age=1.0)
+        max_move = 0.0
+        end = time.time() + seconds
+        while time.time() < end:
+            self.commander.set_velocity(is_y, rid, vx=move_speed, vy=0.0, w=0.0,
+                                        frame="body", safe=False)
+            time.sleep(0.05)
+            s = self.vision.get_pose_sample(is_y, rid, max_age=1.0)
+            if s0 is not None and s is not None:
+                max_move = max(max_move, math.hypot(s.x - s0.x, s.y - s0.y))
+        self.commander.stop_robot(is_y, rid)
+
+        st = self.telemetry.status()
+        rs = self.telemetry.robot_status(is_y, rid)
+        cs = self.commander.stats(is_y, rid)
+        telem_pkts = st.get("packets", 0) - pkt0
+        vis = self.vision.get_pose_sample(is_y, rid, max_age=1.0) is not None
+
+        if cs.get("send_errors", 0) and not cs.get("sends", 0):
+            verdict = ("SEND FAILED — the OS rejected every packet "
+                       f"({cs.get('last_error')}). The IP in ipconfig.yaml is "
+                       "wrong/unroutable. Fix it and check you're on the robot LAN.")
+        elif telem_pkts > 0:
+            if move_speed > 0 and max_move >= 12.0:
+                verdict = (f"ALIVE & MOVING — telemetry returning ({telem_pkts} "
+                           f"pkts) and vision saw {max_move:.0f} mm of motion. "
+                           "Comms are fine.")
+            else:
+                verdict = (f"ALIVE but did not move — telemetry IS returning "
+                           f"({telem_pkts} pkts), so the robot receives commands. "
+                           "Motion is frozen on the robot: SAFE-mode wheel-math / "
+                           "W_LIMIT or wheel units. Fix RobotFramework, not DiagTool.")
+        else:
+            verdict = (f"SILENT — PC sent {cs.get('sends', 0)} commands with no "
+                       "errors, but the robot never replied and "
+                       f"{'vision sees it' if vis else 'vision does NOT see it'}. "
+                       "Nothing is answering at this IP: robot off, RobotFramework "
+                       "not running, wrong IP, or wrong port. Ping it and verify "
+                       "ipconfig.yaml.")
+
+        result = {
+            "robot": robot.label, "ip": robot.ip, "port": robot.port,
+            "robot_id": rid, "seconds": seconds, "move_speed": move_speed,
+            "telemetry_packets": telem_pkts, "telemetry_seen": rs.get("seen", False),
+            "vision_visible": vis, "vision_motion_mm": round(max_move, 1),
+            "commands_sent": cs.get("sends", 0),
+            "send_errors": cs.get("send_errors", 0),
+            "last_error": cs.get("last_error"),
+            "ip_shared_with": conflict or [],
+            "verdict": verdict,
+        }
+        log(f"  {verdict}")
+        return result
 
     # -- lifecycle --
     def start(self) -> None:
@@ -210,7 +307,8 @@ class Engine:
         st = self.source_status()
         rep = report.build_report(
             all_results, cal, st["vision"], st["telemetry"],
-            meta={"robots": [r.label for r in robots], "tests": test_names})
+            meta={"robots": [r.label for r in robots], "tests": test_names,
+                  "ip_conflicts": ip_conflicts(robots)})
 
         out_dir = Path(output_dir) if output_dir else (
             DEFAULT_OUTPUT / time.strftime("%Y%m%d_%H%M%S"))

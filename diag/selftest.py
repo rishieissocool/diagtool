@@ -474,6 +474,20 @@ def settings_merge_with_defaults():
 
 
 @_test("config/engine")
+def ip_conflict_detection():
+    from .engine import RobotInfo, ip_conflicts
+    rs = [
+        RobotInfo(True, 3, "192.168.1.4", 50514, "D"),    # Y3
+        RobotInfo(False, 1, "192.168.1.4", 50514, "B"),   # B1  -> conflict
+        RobotInfo(True, 1, "192.168.1.7", 50514, "B"),    # Y1  -> unique
+        RobotInfo(False, 0, "127.0.0.1", 50514, "A"),     # loopback -> ignored
+        RobotInfo(True, 0, "127.0.0.1", 50514, "A"),      # loopback -> ignored
+    ]
+    c = ip_conflicts(rs)
+    assert c == {"192.168.1.4": ["B1", "Y3"]}, c          # only the real clash
+
+
+@_test("config/engine")
 def engine_parses_ipconfig_inventory():
     from .engine import Engine
     try:
