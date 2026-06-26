@@ -150,6 +150,16 @@ class MainWindow(QMainWindow):
             self._test_btns.append(b)
         rl.addWidget(ctrl)
 
+        testall_row = QHBoxLayout()
+        self.btn_testall = QPushButton("▶ Run All Tests (selected robot)")
+        self.btn_testall.setStyleSheet("font-weight:bold; padding:6px;")
+        self.btn_testall.setToolTip(
+            "Run the full diagnostic battery on the highlighted robot and "
+            "write a report — one click for everything.")
+        self.btn_testall.clicked.connect(self._run_test_all)
+        testall_row.addWidget(self.btn_testall, 1)
+        rl.addLayout(testall_row)
+
         sweep_row = QHBoxLayout()
         self.btn_sweep = QPushButton("Run Full Sweep (real robots)")
         self.btn_sweep.clicked.connect(self._run_sweep)
@@ -206,6 +216,7 @@ class MainWindow(QMainWindow):
     def _busy(self, busy: bool):
         for b in self._test_btns:
             b.setEnabled(not busy)
+        self.btn_testall.setEnabled(not busy)
         self.btn_sweep.setEnabled(not busy)
         self.btn_selftest.setEnabled(not busy)
         self.btn_stop.setEnabled(busy)
@@ -263,6 +274,16 @@ class MainWindow(QMainWindow):
                                     "Pick a robot in the table first.")
             return
         self._start_worker({"kind": "test", "name": name, "robot": r})
+
+    def _run_test_all(self):
+        r = self._selected_robot()
+        if r is None:
+            QMessageBox.information(self, "Select a robot",
+                                    "Pick a robot in the table first.")
+            return
+        tests = [d.name for d in ALL_DIAGNOSTICS]
+        self._append_log(f"Running all {len(tests)} tests on {r.label}...")
+        self._start_worker({"kind": "sweep", "robots": [r], "tests": tests})
 
     def _run_sweep(self):
         robots = self.engine.robots(real_only=True)

@@ -111,7 +111,35 @@ python run_diag.py --cli sweep --robots Y0,Y1 --tests command_latency,speed_scal
 Test names: `vision_health`, `telemetry_health`, `command_latency`,
 `stop_latency`, `speed_scale`, `angular`.
 
+`sweep --robot Y0` runs the **whole battery on one robot** (the GUI's
+**▶ Run All Tests (selected robot)** button does the same).
+
 Tune trial counts / speeds / thresholds in `diag_settings.yaml`.
+
+### "NO MOTION within timeout" — how to read it
+
+DiagTool streams commands the same way the real 2026 dispatcher does
+(`RobotCommand` → `Sender.send(cmd, ip, port)`), but it also **instruments every
+send** so a no-motion result tells you *where* the problem is. Each failed trial
+now prints, e.g.:
+
+```
+trial 1: NO MOTION within timeout  [sent=78 no_pose=0 safety=0 send_err=0 last_vel=(0.30,0.00,0.00)]
+```
+
+* `sent>0, no_pose=0, send_err=0` → the PC **did** stream a real velocity and the
+  robot didn't move → it's the **robot** (SAFE-mode `W_LIMIT` freeze, wheel
+  units, comms on the robot side — see the suspects).
+* `no_pose>0` → DiagTool zeroed the command because **vision** couldn't see the
+  robot (wrong `shellID`↔pattern-ID mapping, low fps, occlusion). Fix vision /
+  `ipconfig.yaml`, or raise `drive_grace_s`.
+* `send_err>0` → the UDP send **failed** — almost always a wrong/unreachable
+  robot IP in `ipconfig.yaml` (`last_error` shows the OS error).
+
+To test the **command link itself** when vision is unreliable, set
+`latency_direct_send: true` in `diag_settings.yaml`: the latency/rotation tests
+then stream the command straight to the robot's `ip:port` with no vision gate or
+wall guard — exactly like the real dispatcher — so you can watch the robot move.
 
 ### Self-test (no robots, no network)
 

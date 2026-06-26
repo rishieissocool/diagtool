@@ -112,6 +112,8 @@ class Engine:
             send_hz=float(self.settings.get("send_hz", 50.0)),
             pose_max_age=float(self.settings.get("pose_max_age_s",
                                                  DEFAULTS["pose_max_age_s"])),
+            drive_grace=float(self.settings.get("drive_grace_s",
+                                                DEFAULTS["drive_grace_s"])),
         )
         # register every robot so the commander can drive any of them
         for r in self.robots():

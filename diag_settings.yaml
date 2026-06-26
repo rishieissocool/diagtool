@@ -5,6 +5,13 @@
 # --- command streaming ---
 send_hz: 50.0            # how fast DiagTool streams commands to a robot (Hz)
 pose_max_age_s: 0.30     # ignore vision poses older than this when driving
+drive_grace_s: 0.5       # keep driving on the last good pose this long after
+                         # vision goes stale (bridges brief dropouts instead of
+                         # instantly zeroing the command -> avoids false "no motion")
+latency_direct_send: false  # true = stream the latency/rotation command straight
+                            # to the robot like the real 2026 dispatcher (no vision
+                            # gate, no wall guard). Use when vision is unreliable
+                            # and you just need to prove the command link works.
 
 # --- motion thresholds (tuned to be above typical vision noise) ---
 onset_disp_mm: 12.0      # displacement that counts as "started moving"

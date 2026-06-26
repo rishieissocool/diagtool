@@ -40,6 +40,12 @@ DEFAULTS = {
     "vel_window_s": 0.22,       # window for instantaneous velocity estimate
     "poll_s": 0.004,            # vision poll period inside loops
     "pose_max_age_s": 0.30,     # ignore vision poses older than this
+    "drive_grace_s": 0.5,       # keep driving on the last good pose this long
+                                # after vision goes stale (vs zeroing instantly)
+    "latency_direct_send": False,  # latency/rotation tests stream the command
+                                # straight to the robot (no vision gate), like
+                                # the real dispatcher — set True if vision is
+                                # unreliable and you just need the link tested
     "latency_trials": 6,
     "stop_trials": 5,
     "angular_trials": 4,
@@ -191,6 +197,36 @@ class Diagnostic:
         self.cmd.set_velocity(robot.is_yellow, robot.robot_id,
                               vx=vx, vy=vy, w=w, frame="world")
 
+    # -- send instrumentation (so "no motion" is diagnosable) --
+    def _reset_cmd_stats(self, robot):
+        fn = getattr(self.cmd, "reset_stats", None)
+        if fn:
+            fn(robot.is_yellow, robot.robot_id)
+
+    def _cmd_stats(self, robot) -> dict:
+        fn = getattr(self.cmd, "stats", None)
+        return fn(robot.is_yellow, robot.robot_id) if fn else {}
+
+    def _explain_no_motion(self, robot) -> str:
+        """Compact reason string appended to a 'no motion' log line.
+
+        Tells you whether the PC actually streamed commands (robot's fault) or
+        zeroed/failed them (vision-gate, safety, or a bad robot address).
+        """
+        st = self._cmd_stats(robot)
+        if not st:
+            return ""
+        parts = [f"sent={st.get('sends', '?')}",
+                 f"no_pose={st.get('zeroed_no_pose', 0)}",
+                 f"safety={st.get('zeroed_safety', 0)}",
+                 f"send_err={st.get('send_errors', 0)}"]
+        ls = st.get("last_sent")
+        if ls:
+            parts.append(f"last_vel=({ls[0]:.2f},{ls[1]:.2f},{ls[2]:.2f})")
+        if st.get("last_error"):
+            parts.append(f"err={st['last_error']}")
+        return "  [" + " ".join(parts) + "]"
+
     def _dir_to_open(self, pose):
         """World unit vector pointing into open field (toward centre)."""
         x, y, _ = pose
@@ -327,6 +363,10 @@ class CommandLatencyDiagnostic(Diagnostic):
         trials = int(self.s("latency_trials"))
         speed = float(self.s("test_speed_ms"))
         onset = float(self.s("onset_disp_mm"))
+        direct = bool(self.s("latency_direct_send"))
+        if direct:
+            log("  [direct send] streaming command straight to the robot "
+                "(no vision gate / wall guard) — like the real dispatcher.")
         lat_ms, no_motion = [], 0
         try:
             for i in range(trials):
@@ -340,8 +380,15 @@ class CommandLatencyDiagnostic(Diagnostic):
                 ux, uy = self._dir_to_open(s0.pose())
                 p0 = (s0.x, s0.y)
 
+                self._reset_cmd_stats(robot)
                 t_cmd = time.perf_counter()
-                self._drive_world(robot, ux * speed, uy * speed)
+                if direct:
+                    # body-frame forward nudge, sent straight through
+                    self.cmd.set_velocity(robot.is_yellow, robot.robot_id,
+                                          vx=speed, vy=0.0, w=0.0,
+                                          frame="body", safe=False)
+                else:
+                    self._drive_world(robot, ux * speed, uy * speed)
 
                 def moved(s, _):
                     return math.hypot(s.x - p0[0], s.y - p0[1]) >= onset
@@ -354,7 +401,8 @@ class CommandLatencyDiagnostic(Diagnostic):
                     log(f"  trial {i + 1}: latency={dt:.0f} ms")
                 else:
                     no_motion += 1
-                    log(f"  trial {i + 1}: NO MOTION within timeout")
+                    log(f"  trial {i + 1}: NO MOTION within timeout"
+                        + self._explain_no_motion(robot))
         finally:
             self._settle(robot, log, stop, dur=0.5)
 
@@ -363,8 +411,13 @@ class CommandLatencyDiagnostic(Diagnostic):
             "trials": trials,
             "no_motion_trials": no_motion,
             "commanded_speed_ms": speed,
+            "direct_send": direct,
+            "send_stats": self._cmd_stats(robot),
             "note": ("Includes vision latency; subtract vision_health "
-                     "sent_latency to approximate actuation-only delay."),
+                     "sent_latency to approximate actuation-only delay. If "
+                     "no_motion: 'sent>0 no_pose=0 send_err=0' points at the "
+                     "robot (SAFE-mode/comms); 'no_pose>0' at vision; "
+                     "'send_err>0' at a bad robot IP in ipconfig.yaml."),
         }
         return res
 
@@ -562,6 +615,7 @@ class AngularDiagnostic(Diagnostic):
         trials = int(self.s("angular_trials"))
         w_cmd = min(float(self.s("test_w_rads")), self.lim.max_w)
         onset = float(self.s("onset_angle_rad"))
+        direct = bool(self.s("latency_direct_send"))
         lat_ms, scales, no_motion = [], [], 0
         sign = 1
         try:
@@ -576,9 +630,11 @@ class AngularDiagnostic(Diagnostic):
                 o0 = s0.o
                 w_target = sign * w_cmd
 
+                self._reset_cmd_stats(robot)
                 t_cmd = time.perf_counter()
                 self.cmd.set_velocity(robot.is_yellow, robot.robot_id,
-                                      vx=0, vy=0, w=w_target, frame="world")
+                                      vx=0, vy=0, w=w_target, frame="world",
+                                      safe=not direct)
 
                 def turned(s, _):
                     return abs(_ang_diff(s.o, o0)) >= onset
@@ -605,7 +661,8 @@ class AngularDiagnostic(Diagnostic):
                         f"actual_w={actual_w:.3f} rad/s (scale={scale:.3f})")
                 else:
                     no_motion += 1
-                    log(f"  trial {i + 1}: NO ROTATION within timeout")
+                    log(f"  trial {i + 1}: NO ROTATION within timeout"
+                        + self._explain_no_motion(robot))
                 self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
                 sign = -sign
         finally:
@@ -617,6 +674,8 @@ class AngularDiagnostic(Diagnostic):
             "w_scale": summarize(scales, ""),
             "trials": trials,
             "no_motion_trials": no_motion,
+            "direct_send": direct,
+            "send_stats": self._cmd_stats(robot),
         }
 
 

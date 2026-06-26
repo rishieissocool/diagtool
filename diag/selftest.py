@@ -523,6 +523,126 @@ def engine_start_stop_no_transmit():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 7b. commander — the actual send path (real Commander, recording sender)
+# ══════════════════════════════════════════════════════════════════════════
+
+class _RecordingSender:
+    """Stands in for TeamControl's Sender — records sends, can fake failures."""
+
+    def __init__(self):
+        self.sent = []
+        self.fail = False
+
+    def send(self, msg, ip, port):
+        if self.fail:
+            raise OSError("network unreachable")
+        self.sent.append((str(msg), ip, port))
+
+
+class _PoseVision:
+    """Minimal VisionSource stand-in returning a fixed (or no) pose."""
+
+    def __init__(self, sample):
+        self._s = sample
+
+    def get_pose_sample(self, is_yellow, robot_id, max_age=None):
+        return self._s
+
+    def get_pose(self, is_yellow, robot_id, max_age=None):
+        return self._s.pose() if self._s else None
+
+
+def _make_commander(vision):
+    from .commander import Commander
+    try:
+        cmd = Commander(vision, sender_ip=None, send_hz=50.0,
+                        pose_max_age=0.30, drive_grace=0.0)
+    except bridge.MissingDependency as e:
+        raise SkipTest(str(e))
+    except (bridge.TeamControlNotFound, ImportError) as e:
+        raise SkipTest(f"dependency missing: {e}")
+    rec = _RecordingSender()
+    cmd._sender = rec
+    return cmd, rec
+
+
+def _fresh_pose():
+    now = time.perf_counter()
+    return PoseSample(x=0.0, y=0.0, o=0.0, confidence=1.0, frame_number=1,
+                      t_perf=now, t_wall=time.time(),
+                      t_capture=time.time(), t_sent=time.time())
+
+
+@_test("commander")
+def commander_drives_with_fresh_pose():
+    cmd, rec = _make_commander(_PoseVision(_fresh_pose()))
+    cmd.register(True, 1, "127.0.0.1", 50514)
+    cmd.set_velocity(True, 1, vx=0.30, vy=0.0, w=0.0, frame="world", safe=True)
+    cmd._send_one(cmd._targets[(True, 1)])
+    assert rec.sent, "nothing was sent"
+    st = cmd.stats(True, 1)
+    assert st["sends"] == 1 and st["send_errors"] == 0
+    assert math.hypot(st["last_sent"][0], st["last_sent"][1]) > 0.1
+
+
+@_test("commander")
+def commander_safe_zeroes_without_pose():
+    cmd, rec = _make_commander(_PoseVision(None))
+    cmd.register(True, 1, "127.0.0.1", 50514)
+    cmd.set_velocity(True, 1, vx=0.30, vy=0.0, w=0.0, frame="world", safe=True)
+    cmd._send_one(cmd._targets[(True, 1)])
+    st = cmd.stats(True, 1)
+    assert st["last_sent"] == (0.0, 0.0, 0.0), "drove a robot it can't see"
+    assert st["zeroed_no_pose"] == 1
+    assert rec.sent, "should still send an explicit stop"
+
+
+@_test("commander")
+def commander_direct_sends_without_pose():
+    # direct mode mirrors the real dispatcher: command goes through with no pose
+    cmd, rec = _make_commander(_PoseVision(None))
+    cmd.register(True, 1, "127.0.0.1", 50514)
+    cmd.set_velocity(True, 1, vx=0.30, vy=0.0, w=0.0, frame="body", safe=False)
+    cmd._send_one(cmd._targets[(True, 1)])
+    st = cmd.stats(True, 1)
+    assert st["sends"] == 1 and st["zeroed_no_pose"] == 0
+    assert approx(st["last_sent"][0], 0.30, 1e-6), st["last_sent"]
+
+
+@_test("commander")
+def commander_counts_send_errors():
+    cmd, rec = _make_commander(_PoseVision(_fresh_pose()))
+    rec.fail = True                                    # simulate a bad robot IP
+    cmd.register(True, 1, "203.0.113.9", 50514)
+    cmd.set_velocity(True, 1, vx=0.30, vy=0.0, w=0.0, frame="world", safe=True)
+    cmd._send_one(cmd._targets[(True, 1)])
+    st = cmd.stats(True, 1)
+    assert st["send_errors"] == 1 and st["sends"] == 0
+    assert st["last_error"] and "OSError" in st["last_error"]
+
+
+@_test("commander")
+def commander_grace_bridges_brief_dropout():
+    # fresh pose first, then vision goes blank — within grace it keeps driving
+    vision = _PoseVision(_fresh_pose())
+    from .commander import Commander
+    try:
+        cmd = Commander(vision, sender_ip=None, send_hz=50.0,
+                        pose_max_age=0.30, drive_grace=1.0)
+    except (bridge.MissingDependency, bridge.TeamControlNotFound, ImportError) as e:
+        raise SkipTest(str(e))
+    cmd._sender = _RecordingSender()
+    cmd.register(True, 1, "127.0.0.1", 50514)
+    cmd.set_velocity(True, 1, vx=0.30, vy=0.0, w=0.0, frame="world", safe=True)
+    cmd._send_one(cmd._targets[(True, 1)])             # caches a good pose
+    vision._s = None                                   # vision drops out
+    cmd._send_one(cmd._targets[(True, 1)])             # still within grace
+    st = cmd.stats(True, 1)
+    assert st["zeroed_no_pose"] == 0, "grace did not bridge the dropout"
+    assert math.hypot(st["last_sent"][0], st["last_sent"][1]) > 0.1
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 8. simulated end-to-end sweep — real Diagnostics vs a fake robot model
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -634,7 +754,7 @@ class _SimCommander:
         pass
 
     def set_velocity(self, is_yellow, robot_id, vx=0.0, vy=0.0, w=0.0,
-                     frame="world", kick=0, dribble=0):
+                     frame="world", kick=0, dribble=0, safe=True):
         if (bool(is_yellow), int(robot_id)) != self.key:
             return
         self.robot.set_cmd(float(vx), float(vy), float(w))
@@ -648,6 +768,13 @@ class _SimCommander:
 
     def last_sent(self, is_yellow, robot_id):
         return self._last_sent
+
+    def stats(self, is_yellow, robot_id):
+        return {"sends": 0, "send_errors": 0, "zeroed_no_pose": 0,
+                "zeroed_safety": 0, "last_sent": self._last_sent}
+
+    def reset_stats(self, is_yellow, robot_id):
+        pass
 
 
 class _SimTelemetry:

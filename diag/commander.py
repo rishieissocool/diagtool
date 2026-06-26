@@ -14,8 +14,14 @@ every send:
   4. records the *actually sent* velocity so diagnostics measure scale against
      what was transmitted, not merely what was requested.
 
-If a robot's pose is unknown/stale, the Commander sends a zero command (it
-will never drive a robot it can't see — that's how you hit a wall).
+In *safe* mode (default) a robot whose pose is unknown is sent a zero command —
+it will never drive a robot it can't see (that's how you hit a wall) — but a
+brief vision dropout is bridged with the last good pose (`drive_grace`) so a
+single stale frame no longer kills the whole command stream. In *direct* mode
+(`safe=False`) the command is streamed straight to the robot's ip:port exactly
+like the real dispatcher, with no vision gate, for testing the command link
+itself. Every send is counted (sends / no-pose / safety / errors) so a "no
+motion" result can be traced to its cause.
 """
 
 from __future__ import annotations
@@ -37,6 +43,8 @@ class Target:
     port: int
     enabled: bool = False
     frame: str = "world"        # "world" | "body"
+    safe: bool = True           # False -> send straight through (like the
+                                # real dispatcher), no vision gate / wall guard
     vx: float = 0.0
     vy: float = 0.0
     w: float = 0.0
@@ -46,17 +54,31 @@ class Target:
     last_sent: tuple[float, float, float] = (0.0, 0.0, 0.0)
     last_blocked: bool = False
     rate: RateMeter = field(default_factory=lambda: RateMeter(window=120))
+    # last known-good pose, for grace driving across brief vision dropouts
+    _last_pose: tuple | None = None
+    _last_pose_t: float = 0.0
+    last_pose_age: float | None = None
+    # per-target send instrumentation (so "no motion" is diagnosable)
+    sends: int = 0
+    send_errors: int = 0
+    zeroed_no_pose: int = 0
+    zeroed_safety: int = 0
+    last_error: str | None = None
 
 
 class Commander:
     def __init__(self, vision: VisionSource, sender_ip: str | None = None,
-                 send_hz: float = 50.0, pose_max_age: float = 0.4):
+                 send_hz: float = 50.0, pose_max_age: float = 0.4,
+                 drive_grace: float = 0.5):
         Sender, RobotCommand = bridge.get_command_classes()
         self._RobotCommand = RobotCommand
         self._sender = Sender(device_ip=sender_ip) if sender_ip else Sender(device_ip=None)
         self._vision = vision
         self._period = 1.0 / send_hz
         self._pose_max_age = pose_max_age
+        # keep driving on the last good pose for this long after vision goes
+        # stale, instead of instantly zeroing the command stream
+        self._drive_grace = max(0.0, float(drive_grace))
         self._lim = safety.limits()
 
         self._targets: dict[tuple[bool, int], Target] = {}
@@ -103,11 +125,13 @@ class Commander:
 
     def set_velocity(self, is_yellow: bool, robot_id: int,
                      vx: float = 0.0, vy: float = 0.0, w: float = 0.0,
-                     frame: str = "world", kick: int = 0, dribble: int = 0) -> None:
+                     frame: str = "world", kick: int = 0, dribble: int = 0,
+                     safe: bool = True) -> None:
         with self._lock:
             t = self._targets.get((bool(is_yellow), int(robot_id)))
             if t:
                 t.frame = frame
+                t.safe = bool(safe)
                 t.vx, t.vy, t.w = float(vx), float(vy), float(w)
                 t.kick, t.dribble = int(kick), int(dribble)
                 t.enabled = True
@@ -125,6 +149,39 @@ class Commander:
         with self._lock:
             t = self._targets.get((bool(is_yellow), int(robot_id)))
             return t.last_sent if t else None
+
+    def stats(self, is_yellow: bool, robot_id: int) -> dict:
+        """Snapshot of what the streamer is actually doing for this robot.
+
+        Lets a diagnostic explain a 'no motion' result: did the PC send real
+        commands (so the robot is the problem), or did it zero them for lack of
+        a vision pose / safety, or fail to send at all (bad IP / unreachable)?
+        """
+        with self._lock:
+            t = self._targets.get((bool(is_yellow), int(robot_id)))
+            if not t:
+                return {}
+            return {
+                "sends": t.sends,
+                "send_errors": t.send_errors,
+                "zeroed_no_pose": t.zeroed_no_pose,
+                "zeroed_safety": t.zeroed_safety,
+                "last_sent": t.last_sent,
+                "last_blocked": t.last_blocked,
+                "last_error": t.last_error,
+                "last_pose_age": t.last_pose_age,
+                "send_rate_hz": round(t.rate.rate_hz, 1),
+                "ip": t.ip,
+                "port": t.port,
+            }
+
+    def reset_stats(self, is_yellow: bool, robot_id: int) -> None:
+        with self._lock:
+            t = self._targets.get((bool(is_yellow), int(robot_id)))
+            if t:
+                t.sends = t.send_errors = 0
+                t.zeroed_no_pose = t.zeroed_safety = 0
+                t.last_error = None
 
     # -- thread body --
     def _loop(self) -> None:
@@ -145,28 +202,74 @@ class Commander:
             self._send_one(t)
 
     def _send_one(self, t: Target) -> None:
-        pose = self._vision.get_pose(t.is_yellow, t.robot_id,
-                                     max_age=self._pose_max_age)
-        if pose is None:
-            # Can't see the robot -> never drive it. Send a stop.
-            vx_r = vy_r = w = 0.0
-            blocked = True
+        now = time.perf_counter()
+        sample = self._vision.get_pose_sample(t.is_yellow, t.robot_id, max_age=None)
+        if sample is not None:
+            pose = sample.pose()
+            age = max(0.0, now - sample.t_perf)
+            with self._lock:
+                t._last_pose = pose
+                t._last_pose_t = sample.t_perf
+                t.last_pose_age = age
+            fresh = age <= self._pose_max_age
         else:
+            with self._lock:
+                t.last_pose_age = None
+            fresh = False
+
+        # Pose used for the safety transform: the fresh one, or — across a brief
+        # vision dropout — the last good one (grace), else none.
+        if fresh:
+            drive_pose = t._last_pose
+        elif t._last_pose is not None and (now - t._last_pose_t) <= self._drive_grace:
+            drive_pose = t._last_pose
+        else:
+            drive_pose = None
+
+        want_motion = bool(t.vx or t.vy or t.w)
+        reason = None
+        blocked = False
+
+        if not t.safe:
+            # DIRECT mode — send the command straight to the robot exactly like
+            # the real dispatcher (no vision gate, no wall guard). Magnitude is
+            # still capped to MAX_SPEED / MAX_W so a typo can't launch it.
+            vx_r, vy_r, w = safety.clamp_velocity(t.vx, t.vy, t.w, self._lim)
+        elif drive_pose is not None:
             if t.frame == "body":
                 vx_r, vy_r, w, blocked = safety.safe_body_velocity(
-                    pose, t.vx, t.vy, t.w, self._lim)
+                    drive_pose, t.vx, t.vy, t.w, self._lim)
             else:
                 vx_r, vy_r, w, blocked = safety.safe_world_velocity(
-                    pose, t.vx, t.vy, t.w, self._lim)
+                    drive_pose, t.vx, t.vy, t.w, self._lim)
+            if blocked and want_motion:
+                reason = "safety"
+        else:
+            # Safe mode with no usable pose -> never drive a robot we can't see.
+            vx_r = vy_r = w = 0.0
+            blocked = True
+            if want_motion:
+                reason = "no_pose"
 
         cmd = self._RobotCommand(
             robot_id=t.robot_id, vx=vx_r, vy=vy_r, w=w,
             kick=t.kick, dribble=t.dribble, isYellow=t.is_yellow)
         try:
             self._sender.send(cmd, t.ip, t.port)
-        except Exception:
-            pass
+            sent_ok, err = True, None
+        except Exception as e:                      # bad address / unreachable
+            sent_ok, err = False, f"{type(e).__name__}: {e}"
+
         with self._lock:
             t.last_sent = (vx_r, vy_r, w)
             t.last_blocked = blocked
+            if sent_ok:
+                t.sends += 1
+            else:
+                t.send_errors += 1
+                t.last_error = err
+            if reason == "no_pose":
+                t.zeroed_no_pose += 1
+            elif reason == "safety":
+                t.zeroed_safety += 1
             t.rate.tick()
