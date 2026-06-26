@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 output/
+
+# Optional local checkout for developing against a live TeamControl tree.
+# DiagTool ships the modules it needs under vendor/TeamControl, so this is
+# never part of the repo. Point at it with TEAMCONTROL_SRC if you have one.
+/2026-TeamControl/

@@ -6,7 +6,7 @@ enough to calibrate, we reuse the *exact* limits and helpers the real program
 uses:
 
   * MAX_SPEED / MAX_W              from TeamControl.robot.constants
-  * field geometry (HALF_LEN ...)  from TeamControl.robot.constants
+  * field half-extents             via bridge.get_field_geometry()
   * wall_brake() / clamp()         from TeamControl.robot.ball_nav
 
 On top of those we add a hard *outward-velocity guard*: if a robot is within
@@ -52,11 +52,12 @@ class Limits:
 
 def limits() -> Limits:
     c = _consts()
+    half_len, half_wid = bridge.get_field_geometry()
     return Limits(
         max_speed=float(c.MAX_SPEED),
         max_w=float(c.MAX_W),
-        half_len=float(c.HALF_LEN),
-        half_wid=float(c.HALF_WID),
+        half_len=half_len,
+        half_wid=half_wid,
         robot_radius=float(c.ROBOT_RADIUS),
         field_margin=float(c.FIELD_MARGIN),
     )

@@ -1,10 +1,16 @@
 """
-bridge.py — locate and import the 2026-TeamControl package without modifying it.
+bridge.py — locate and import the TeamControl package without modifying it.
 
 DiagTool deliberately re-uses TeamControl's already-tested code instead of
 re-implementing UDP framing, the exact wire format the robots expect, the
 vision protobuf decode, and the movement/limit constants. That guarantees we
 measure and drive the robots the *same way* the real program does.
+
+To stay self-contained, DiagTool ships a vendored copy of the *specific*
+TeamControl modules it needs under ``diagtool/vendor/TeamControl`` (see
+``vendor/README.md``). That copy is the default source, so the tool runs with
+no external 2026-TeamControl checkout. Developers can still point it at a live
+tree via ``$TEAMCONTROL_SRC`` or a sibling checkout.
 
 We never import the whole TeamControl package eagerly, because some of it
 (the `ui` and `network.ssl_sockets` modules) pulls in heavy optional deps
@@ -13,9 +19,10 @@ through the thin accessors below, which raise a clear, actionable error if a
 dependency is missing.
 
 Resolution order for the TeamControl source root:
-    1. $TEAMCONTROL_SRC environment variable, if set.
-    2. A sibling "2026-TeamControl/src" next to the diagtool folder.
-    3. Walk upward from here looking for "2026-TeamControl/src".
+    1. $TEAMCONTROL_SRC environment variable, if set (explicit override).
+    2. The vendored copy shipped inside diagtool ("vendor/").
+    3. A sibling "2026-TeamControl/src" next to the diagtool folder, then
+       walking upward — for developing against a live TeamControl tree.
 """
 
 from __future__ import annotations
@@ -40,11 +47,16 @@ def _candidate_roots() -> list[Path]:
     here = Path(__file__).resolve()
     roots: list[Path] = []
 
+    # 1. Explicit override.
     env = os.environ.get("TEAMCONTROL_SRC")
     if env:
         roots.append(Path(env))
 
-    # diagtool/diag/bridge.py -> parents[1] = diagtool, parents[2] = testing
+    # 2. Vendored copy shipped inside diagtool (self-contained default).
+    #    diagtool/diag/bridge.py -> parents[1] = diagtool
+    roots.append(here.parents[1] / "vendor")
+
+    # 3. A live sibling "2026-TeamControl/src", walking upward (dev mode).
     for parent in list(here.parents)[1:6]:
         roots.append(parent / "2026-TeamControl" / "src")
 
@@ -67,9 +79,11 @@ def teamcontrol_src() -> Path:
 
     tried = "\n  ".join(str(c) for c in _candidate_roots())
     raise TeamControlNotFound(
-        "Could not find 2026-TeamControl/src. Set the TEAMCONTROL_SRC "
-        "environment variable to its path, or keep diagtool next to the "
-        "2026-TeamControl folder.\nLooked in:\n  " + tried
+        "Could not import TeamControl. DiagTool ships a vendored copy under "
+        "'vendor/TeamControl' — if that is missing, restore it, set the "
+        "TEAMCONTROL_SRC environment variable to a 2026-TeamControl/src path, "
+        "or keep diagtool next to the 2026-TeamControl folder.\nLooked in:\n  "
+        + tried
     )
 
 
@@ -126,6 +140,28 @@ def get_constants():
     ensure_on_path()
     from TeamControl.robot import constants
     return constants
+
+
+def get_field_geometry() -> tuple[float, float]:
+    """Return (half_len_mm, half_wid_mm) — the field half-extents in ±x, ±y.
+
+    Older TeamControl exposed these as ``constants.HALF_LEN`` / ``HALF_WID``.
+    Current versions keep field geometry in ``world.field_config`` instead
+    (``FIELD_X_MAX`` / ``FIELD_Y_MAX``). We accept either so DiagTool tracks
+    whichever TeamControl tree it's pointed at without modifying it.
+    """
+    ensure_on_path()
+    from TeamControl.robot import constants
+
+    half_len = getattr(constants, "HALF_LEN", None)
+    half_wid = getattr(constants, "HALF_WID", None)
+    if half_len is None or half_wid is None:
+        from TeamControl.world import field_config as fc
+        if half_len is None:
+            half_len = abs(fc.FIELD_X_MAX)
+        if half_wid is None:
+            half_wid = abs(fc.FIELD_Y_MAX)
+    return float(half_len), float(half_wid)
 
 
 def get_movement_helpers():

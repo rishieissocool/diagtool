@@ -3,11 +3,15 @@
 A standalone tool for **finding and fixing the control-latency problem** with
 the TurtleRabbit robots, and for **calibrating** them.
 
-It is built *on top of* `2026-TeamControl` — it imports and reuses that
-project's network code, vision decode, movement limits, field geometry and
-wall-braking so it drives and measures the robots **exactly the way the real
-program does**. It **never modifies** `2026-TeamControl` or `RobotFramework`;
-it only reads them.
+It is built *on top of* `2026-TeamControl` — it reuses that project's network
+code, vision decode, movement limits, field geometry and wall-braking so it
+drives and measures the robots **exactly the way the real program does**. It
+**never modifies** `2026-TeamControl` or `RobotFramework`; it only reads them.
+
+DiagTool is **self-contained**: the specific TeamControl modules it needs are
+vendored under [`vendor/TeamControl`](vendor/README.md), so it runs with no
+external `2026-TeamControl` checkout. (Developers can still point it at a live
+tree — see *Requirements* below.)
 
 ---
 
@@ -63,23 +67,25 @@ Driving reuses TeamControl's own values:
 
 ## Requirements
 
-DiagTool runs in the **same Python environment as TeamControl**. It needs:
+DiagTool ships the TeamControl code it needs (vendored), so you only install
+Python packages — no separate TeamControl checkout required:
 
 * Python ≥ 3.10
-* `protobuf` (for vision decode) and `PyYAML`
+* `numpy` (vision decode), `protobuf` (vision + network decode), `PyYAML`
 * `PySide6` (only for the GUI — the CLI works without it)
 
 ```
-pip install protobuf PyYAML PySide6
+pip install -r requirements.txt
 ```
 
-It locates `2026-TeamControl/src` automatically (sibling folder). Override with
-`--teamcontrol-src <path>` or the `TEAMCONTROL_SRC` env var.
+The vendored copy under `vendor/TeamControl` is used automatically. To develop
+against a **live** TeamControl tree instead, point DiagTool at its `src` with
+`--teamcontrol-src <path>` or the `TEAMCONTROL_SRC` env var (these take
+precedence over the vendored copy).
 
-Robot IPs/ports and the vision config come from
-`2026-TeamControl/src/TeamControl/utils/ipconfig.yaml` — the same file
-TeamControl uses. (For real robots, ensure that file points at the real
-`192.168.1.x` addresses, not `127.0.0.1`.)
+Robot IPs/ports and the vision config come from DiagTool's own
+[`ipconfig.yaml`](ipconfig.yaml) in this folder. (For real robots, ensure it
+points at the real `192.168.1.x` addresses, not `127.0.0.1`.)
 
 ---
 
@@ -127,9 +133,13 @@ Each sweep writes a timestamped folder under `diagtool/output/`:
 ```
 diagtool/
   run_diag.py            entry point (GUI default, --cli fallback)
+  requirements.txt       Python deps (numpy, protobuf, PyYAML, PySide6)
   diag_settings.yaml     tunable thresholds
+  ipconfig.yaml          robot IPs/ports + vision config
+  vendor/
+    TeamControl/         vendored TeamControl modules DiagTool reuses
   diag/
-    bridge.py            safe imports from 2026-TeamControl
+    bridge.py            safe imports from vendored TeamControl
     metrics.py           stats / rate / jitter helpers
     safety.py            wall-aware velocity limiting (TeamControl limits)
     sources.py           VisionSource + TelemetrySource (threaded)

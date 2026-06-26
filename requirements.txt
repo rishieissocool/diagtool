@@ -1,0 +1,12 @@
+# DiagTool runtime dependencies.
+#
+# The TeamControl code DiagTool reuses is vendored under vendor/TeamControl,
+# so there is NO external 2026-TeamControl checkout to install. These are the
+# Python packages that vendored code (and the GUI) need.
+
+numpy            # SSL vision decode (frame/robots/balls)
+protobuf         # vision + network proto2 message decode
+PyYAML           # ipconfig / settings parsing
+
+# GUI only — the --cli front-end works without it.
+PySide6
