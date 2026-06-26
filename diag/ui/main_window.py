@@ -55,6 +55,14 @@ class Worker(QObject):
                     log=log, progress=prog, stop=self._stop.is_set)
                 self.sig_done.emit({"kind": "test", "name": self.job["name"],
                                     "robot": self.job["robot"].label, "result": res})
+            elif self.job["kind"] == "selftest":
+                from ..selftest import run_selftest
+                rep = run_selftest(
+                    log=log,
+                    include_sim=self.job.get("include_sim", True),
+                    include_net=self.job.get("include_net", False),
+                    stop=self._stop.is_set)
+                self.sig_done.emit({"kind": "selftest", "report": rep})
             else:
                 rep = self.engine.run_sweep(
                     self.job["robots"], self.job["tests"],
@@ -153,6 +161,16 @@ class MainWindow(QMainWindow):
         sweep_row.addWidget(self.btn_stop)
         rl.addLayout(sweep_row)
 
+        selftest_row = QHBoxLayout()
+        self.btn_selftest = QPushButton("Self-Test (offline · no robots)")
+        self.btn_selftest.setToolTip(
+            "Run DiagTool's built-in self-test: unit checks of every module "
+            "plus a simulated end-to-end sweep against a fake robot.\n"
+            "Needs no robots or field network — safe to run from anywhere.")
+        self.btn_selftest.clicked.connect(self._run_selftest)
+        selftest_row.addWidget(self.btn_selftest, 1)
+        rl.addLayout(selftest_row)
+
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.lbl_action = QLabel("idle")
@@ -189,6 +207,7 @@ class MainWindow(QMainWindow):
         for b in self._test_btns:
             b.setEnabled(not busy)
         self.btn_sweep.setEnabled(not busy)
+        self.btn_selftest.setEnabled(not busy)
         self.btn_stop.setEnabled(busy)
 
     def _append_log(self, msg: str):
@@ -230,6 +249,12 @@ class MainWindow(QMainWindow):
             self.summary.setPlainText(
                 f"{payload['robot']} :: {payload['name']}\n"
                 + _short(payload.get("result", {})))
+        elif payload.get("kind") == "selftest":
+            rep = payload.get("report", {})
+            self.summary.setPlainText(rep.get("summary", "(no result)"))
+            self.lbl_action.setText(
+                f"self-test: {rep.get('passed', 0)} passed, "
+                f"{rep.get('failed', 0)} failed, {rep.get('skipped', 0)} skipped")
 
     def _run_test(self, name: str):
         r = self._selected_robot()
@@ -251,6 +276,13 @@ class MainWindow(QMainWindow):
             robots = [r]
         tests = [d.name for d in ALL_DIAGNOSTICS]
         self._start_worker({"kind": "sweep", "robots": robots, "tests": tests})
+
+    def _run_selftest(self):
+        self.log.clear()
+        self._append_log("Running offline self-test (no robots needed)...")
+        self.summary.setPlainText("")
+        self._start_worker({"kind": "selftest",
+                            "include_sim": True, "include_net": False})
 
     def _stop_job(self):
         if self._worker:

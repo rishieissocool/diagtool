@@ -113,6 +113,27 @@ Test names: `vision_health`, `telemetry_health`, `command_latency`,
 
 Tune trial counts / speeds / thresholds in `diag_settings.yaml`.
 
+### Self-test (no robots, no network)
+
+Verify DiagTool itself is healthy from anywhere — even off the field network:
+
+```
+python run_diag.py --cli selftest          # full suite (~10s incl. sim sweep)
+python run_diag.py --cli selftest --no-sim  # skip the simulated sweep (fast)
+python -m diag.selftest                     # same, standalone
+```
+
+In the **GUI**, click **Self-Test (offline · no robots)**.
+
+It runs unit checks of every module (stats, calibration, root-cause rules,
+report writing, motion math, wall-safety limiting, config/inventory) **and** a
+simulated end-to-end sweep: the real diagnostics are driven against a fake
+vision + commander robot model with shrunk timings, so the whole measurement
+pipeline runs with no hardware. Nothing is ever transmitted to a robot. Each
+check is `PASS` / `FAIL` / `SKIP` (skip = an optional dependency such as
+protobuf, or a busy UDP port — not a defect); the process exits non-zero only
+on a real `FAIL`.
+
 ---
 
 ## Output
@@ -149,5 +170,6 @@ diagtool/
     report.py            root-cause analysis + report writing
     engine.py            lifecycle / orchestration
     cli.py               headless front-end
+    selftest.py          offline self-test (unit + simulated sweep)
     ui/                  PySide6 dashboard
 ```

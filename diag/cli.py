@@ -155,6 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
     cp = sub.add_parser("calibrate", help="alias for sweep")
     _add_robot_args(cp)
     cp.add_argument("--tests", help="comma list of test names (default: all)")
+
+    st = sub.add_parser("selftest",
+                        help="offline self-test (no robots/network needed)")
+    st.add_argument("--no-sim", action="store_true",
+                    help="skip the simulated end-to-end sweep (~8s)")
+    st.add_argument("--no-net", action="store_true",
+                    help="skip the socket/engine wiring checks")
     return p
 
 
@@ -178,6 +185,14 @@ def main(argv=None) -> int:
     if args.teamcontrol_src:
         import os
         os.environ["TEAMCONTROL_SRC"] = args.teamcontrol_src
+
+    # selftest is self-contained: it gates its own dependencies and never
+    # needs a live Engine, so run it before any TeamControl/engine setup.
+    if args.command == "selftest":
+        from .selftest import run_selftest
+        rep = run_selftest(log=_log, include_sim=not args.no_sim,
+                           include_net=not args.no_net)
+        return 0 if rep["ok"] else 1
 
     try:
         bridge.ensure_on_path()
