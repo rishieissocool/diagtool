@@ -101,6 +101,12 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.engine.start()
 
+        fi = self.engine.field_info()
+        self._append_log(
+            f"[field] {fi['length_mm']:.0f} x {fi['width_mm']:.0f} mm "
+            f"(source: {fi['source']}); arena ±{fi['arena_half_len_mm']:.0f} x "
+            f"±{fi['arena_half_wid_mm']:.0f} mm")
+
         for ip, labels in self.engine.ip_conflicts().items():
             self._append_log(f"[!] CONFIG: {ip} is shared by {', '.join(labels)} "
                              "— commands for one go to whichever robot answers at "
@@ -403,6 +409,14 @@ class MainWindow(QMainWindow):
 
     # -- live status --
     def _refresh_status(self):
+        # pick up the real field size as soon as SSL-Vision sends geometry
+        if self.engine.refresh_field_geometry():
+            self.field.set_limits(self.engine.lim)
+            fi = self.engine.field_info()
+            self._append_log(
+                f"[field] updated to {fi['length_mm']:.0f} x {fi['width_mm']:.0f} "
+                f"mm (source: {fi['source']}); arena ±{fi['arena_half_len_mm']:.0f} "
+                f"x ±{fi['arena_half_wid_mm']:.0f} mm")
         st = self.engine.source_status()
         v, t = st["vision"], st["telemetry"]
         if v.get("error"):

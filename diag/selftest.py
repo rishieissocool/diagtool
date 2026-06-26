@@ -521,6 +521,28 @@ def settings_merge_with_defaults():
 
 
 @_test("config/engine")
+def field_geometry_resolution():
+    from .engine import resolve_field_half
+    cfg = (2000.0, 1500.0)                              # wrong field_config
+    # vision reports the true field -> used
+    hl, hw, src = resolve_field_half((4500, 2230), None, None, cfg)
+    assert approx(hl, 2250.0) and approx(hw, 1115.0) and src == "vision"
+    # no vision, explicit settings -> used
+    hl, hw, src = resolve_field_half(None, 4500, 2230, cfg)
+    assert approx(hl, 2250.0) and approx(hw, 1115.0) and src == "settings"
+    # both present -> the SMALLER (most conservative) per axis wins
+    hl, hw, src = resolve_field_half((5000, 3000), 4500, 2230, cfg)
+    assert approx(hl, 2250.0) and approx(hw, 1115.0), (hl, hw)
+    assert "vision" in src and "settings" in src
+    # neither real source -> field_config fallback
+    hl, hw, src = resolve_field_half(None, None, None, cfg)
+    assert approx(hl, 2000.0) and approx(hw, 1500.0) and src == "field_config"
+    # a zero/garbage vision size is ignored
+    hl, hw, src = resolve_field_half((0, 0), 4500, 2230, cfg)
+    assert src == "settings"
+
+
+@_test("config/engine")
 def ip_conflict_detection():
     from .engine import RobotInfo, ip_conflicts
     rs = [
@@ -685,6 +707,95 @@ def commander_counts_send_errors():
     st = cmd.stats(True, 1)
     assert st["send_errors"] == 1 and st["sends"] == 0
     assert st["last_error"] and "OSError" in st["last_error"]
+
+
+@_test("commander")
+def commander_set_limits_retightens_arena():
+    # when vision reports a smaller field, new limits must bound driving at once
+    cmd, rec = _make_commander(_PoseVision(_fresh_pose()))
+    cmd.register(True, 1, "127.0.0.1", 50514)
+    # a tiny arena whose edge is right at the robot (x=0): all outward x removed
+    tight = safety.Limits(max_speed=1.0, max_w=1.8, half_len=490.0, half_wid=490.0,
+                          robot_radius=90.0, field_margin=400.0,
+                          boundary_inset=0.0, brake_zone=1.0)
+    assert approx(tight.arena_half_len, 0.0)           # half - margin(490) = 0
+    cmd.set_limits(tight)
+    cmd.set_velocity(True, 1, vx=0.30, vy=0.0, w=0.0, frame="world", safe=True)
+    cmd._send_one(cmd._targets[(True, 1)])
+    st = cmd.stats(True, 1)
+    assert approx(st["last_sent"][0], 0.0, 1e-9), st["last_sent"]   # clamped to arena
+
+
+def _moving_pose(x, y, vx_mm_s, vy_mm_s, frame, dt=1 / 60.0):
+    """A pose whose position implies the given velocity vs the previous frame."""
+    now = time.perf_counter()
+    return PoseSample(x=x, y=y, o=0.0, confidence=1.0, frame_number=frame,
+                      t_perf=now, t_wall=time.time(),
+                      t_capture=time.time(), t_sent=time.time())
+
+
+@_test("commander")
+def emergency_stops_robot_moving_too_fast():
+    # commander with a tiny arena; robot measured moving fast toward +x edge
+    cmd, rec = _make_commander(_PoseVision(None))
+    tight = safety.Limits(max_speed=2.0, max_w=3.0, half_len=2250.0, half_wid=1115.0,
+                          robot_radius=90.0, field_margin=300.0,
+                          boundary_inset=250.0, brake_zone=300.0)
+    cmd.set_limits(tight)
+    cmd.register(True, 1, "127.0.0.1", 50514)
+    t = cmd._targets[(True, 1)]
+    # feed two frames 1/60 s apart implying ~760 mm/s in +x near the +x arena edge
+    vis = _PoseVision(None)
+    cmd._vision = vis
+    x0 = tight.arena_half_len - 300.0
+    vis._s = PoseSample(x=x0, y=0.0, o=0.0, confidence=1.0, frame_number=1,
+                        t_perf=time.perf_counter(), t_wall=time.time(),
+                        t_capture=time.time(), t_sent=time.time())
+    cmd.set_velocity(True, 1, vx=0.10, vy=0.0, w=0.0, frame="world", safe=True)
+    cmd._send_one(t)                                   # establishes velocity ref
+    # next frame ~12.7 mm later in 1/60 s -> ~760 mm/s toward the edge
+    vis._s = PoseSample(x=x0 + 12.7, y=0.0, o=0.0, confidence=1.0, frame_number=2,
+                        t_perf=t._vref_t + 1 / 60.0, t_wall=time.time(),
+                        t_capture=time.time(), t_sent=time.time())
+    cmd._send_one(t)
+    st = cmd.stats(True, 1)
+    assert st["meas_speed_mm_s"] > 300.0, st["meas_speed_mm_s"]
+    assert st["zeroed_emergency"] >= 1, st
+    assert st["last_sent"] == (0.0, 0.0, 0.0), st["last_sent"]
+
+
+@_test("commander")
+def emergency_allows_slow_motion_with_room():
+    cmd, rec = _make_commander(_PoseVision(None))
+    lim = safety.limits(boundary_inset=250.0, brake_zone=300.0,
+                        half_len=2250.0, half_wid=1115.0)
+    cmd.set_limits(lim)
+    cmd.register(True, 1, "127.0.0.1", 50514)
+    t = cmd._targets[(True, 1)]
+    vis = _PoseVision(None); cmd._vision = vis
+    # near centre, slow (~120 mm/s) -> plenty of stopping room -> allowed
+    vis._s = PoseSample(x=0.0, y=0.0, o=0.0, confidence=1.0, frame_number=1,
+                        t_perf=time.perf_counter(), t_wall=time.time(),
+                        t_capture=time.time(), t_sent=time.time())
+    cmd.set_velocity(True, 1, vx=0.10, vy=0.0, w=0.0, frame="world", safe=True)
+    cmd._send_one(t)
+    vis._s = PoseSample(x=2.0, y=0.0, o=0.0, confidence=1.0, frame_number=2,
+                        t_perf=t._vref_t + 1 / 60.0, t_wall=time.time(),
+                        t_capture=time.time(), t_sent=time.time())
+    cmd._send_one(t)
+    st = cmd.stats(True, 1)
+    assert st["zeroed_emergency"] == 0, st
+    assert math.hypot(st["last_sent"][0], st["last_sent"][1]) > 0.05, st["last_sent"]
+
+
+@_test("commander")
+def stop_distance_grows_with_speed():
+    cmd, _ = _make_commander(_PoseVision(None))
+    d_slow = cmd._stop_distance(100.0)
+    d_fast = cmd._stop_distance(760.0)
+    assert d_fast > d_slow > 0
+    # at the measured ~760 mm/s the stopping distance is well over a metre
+    assert d_fast > 1000.0, d_fast
 
 
 @_test("commander")

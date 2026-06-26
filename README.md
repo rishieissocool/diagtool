@@ -56,15 +56,29 @@ Full detail (with file/line refs and suggested fixes) is in every generated
 
 ## Safety — it will not hit walls
 
+The **real field size comes from the SSL-Vision geometry packet** (`field_length`
+/ `field_width`), not a hardcoded constant — so the arena matches the actual
+arena. Until vision reports it, the `field_length_mm` / `field_width_mm` in
+`diag_settings.yaml` are used (and act as a hard cap: the arena never exceeds the
+smaller of vision vs. those). The resolved size is logged on start and shown in
+the field view. *(A wrong hardcoded width is exactly what put a robot into a wall
+before this was fixed.)*
+
 Every command is bounded to a conservative **drive arena** — the field minus
 TeamControl's keep-off margin (`FIELD_MARGIN + ROBOT_RADIUS`) minus an extra
-`boundary_inset_mm`. With the defaults the arena sits ~0.9 m inside every wall.
+`boundary_inset_mm`. With the defaults the arena sits ~0.6 m inside every wall.
 
 * linear speed clamped to `MAX_SPEED`, angular to `MAX_W`,
 * **braking ramp**: the outward velocity is scaled down over `brake_zone_mm`
   before the arena edge, so a robot is already crawling when it reaches the
   line — then any outward component is **hard-zeroed** at the boundary (it can
   always still drive back toward centre),
+* **predictive emergency stop** — the commander measures the robot's *actual*
+  velocity from vision (not the commanded one) and cuts power the instant its
+  real stopping distance (a reaction-time + coast model) would carry it past the
+  arena edge, and immediately if it is moving faster than `safety_max_speed_mm_s`.
+  This is what protects a miscalibrated robot that moves several times faster
+  than commanded, coasts over a metre, or drifts sideways,
 * this guard runs on the commander for **every** send — including manual jog and
   direct mode — so a robot vision can see is *never* driven out of the arena,
 * tests also **stop before the arena edge**, cap travel at `max_travel_mm`, and

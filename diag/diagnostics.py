@@ -50,18 +50,32 @@ DEFAULTS = {
     "stop_trials": 5,
     "angular_trials": 4,
     "speed_passes": 4,
-    "test_speed_ms": 0.30,      # commanded linear speed for motion tests
-    "test_w_rads": 0.25,        # commanded angular speed for rotation test
+    "test_speed_ms": 0.12,      # commanded linear speed for motion tests — LOW
+                                # on purpose: a miscalibrated robot can move
+                                # several x faster than commanded, so keep the
+                                # real speed (and coast) small near walls
+    "test_w_rads": 0.20,        # commanded angular speed for rotation test
     "accel_settle_s": 0.5,      # ignore this much accel before steady measure
     "stop_buffer_mm": 350.0,    # stop a run this far before the arena edge
     "max_run_s": 4.0,           # hard cap on any single run (s)
     "max_travel_mm": 800.0,     # hard cap on how far a robot may travel per run
     "health_window_s": 6.0,     # observation window for health tests
+    # --- field geometry (mm); None -> use SSL-Vision geometry / field_config ---
+    "field_length_mm": None,       # explicit field length override (x, goal-goal)
+    "field_width_mm": None,        # explicit field width override (y, touchlines)
     # --- arena / wall safety (smaller = robots stay further from walls) ---
-    "boundary_inset_mm": 500.0,    # shrink the drive arena this far inside the
+    "boundary_inset_mm": 250.0,    # shrink the drive arena this far inside the
                                    # keep-off margin (robots never leave it)
-    "brake_zone_mm": 400.0,        # decel ramp distance before the arena edge
+    "brake_zone_mm": 300.0,        # decel ramp distance before the arena edge
     "direct_blind_speed_ms": 0.25, # speed cap for direct/jog with no vision
+    # --- predictive emergency stop (uses MEASURED vision velocity) ---
+    # Catches a robot that moves faster than commanded or coasts/drifts: it is
+    # cut the moment its real stopping distance would breach the arena. Tuned
+    # conservatively from measured coast (~1.2 m) and latency (~0.5 s).
+    "safety_reaction_s": 0.6,      # assumed react-to-stop delay (>= cmd latency)
+    "safety_decel_mm_s2": 250.0,   # assumed braking decel (lower = safer/earlier)
+    "safety_factor": 1.5,          # extra margin on the stopping distance
+    "safety_max_speed_mm_s": 600.0,# hard cap: stop if actually moving faster
 }
 
 
@@ -240,6 +254,17 @@ class Diagnostic:
         if d < 250:
             return (1.0, 0.0)   # already central; pick +x (most room)
         return (-x / d, -y / d)
+
+    def _open_x_dir(self, pose):
+        """Drive direction along the long (x) axis toward open field, and the
+        room that way (mm). Always points away from the nearer end wall — it
+        never reverses toward a wall the way a naive 'flip' can."""
+        x = pose[0]
+        ux = -1.0 if x > 0 else 1.0
+        return ux, 0.0, self._room_ahead(pose, ux, 0.0)
+
+    def _emergency_seen(self, robot) -> bool:
+        return bool(self._cmd_stats(robot).get("zeroed_emergency", 0))
 
     def _room_ahead(self, pose, ux, uy) -> float:
         x, y, _ = pose
@@ -451,9 +476,16 @@ class StopLatencyDiagnostic(Diagnostic):
                 if s0 is None:
                     skipped += 1
                     continue
-                ux, uy = self._dir_to_open(s0.pose())
-                if self._room_ahead(s0.pose(), ux, uy) < self.s("stop_buffer_mm") + 400:
-                    ux, uy = -ux, -uy  # not enough room ahead; go the other way
+                # Drive along the long axis toward open field — NEVER reverse
+                # toward a wall. Skip the trial if there isn't clear room.
+                ux, uy, room = self._open_x_dir(s0.pose())
+                need = self.s("stop_buffer_mm") + 200.0
+                if room < need:
+                    skipped += 1
+                    log(f"  trial {i + 1}: only {room:.0f} mm of clear room "
+                        f"(need {need:.0f}) — skipped for safety")
+                    continue
+                self._reset_cmd_stats(robot)
                 self._drive_world(robot, ux * speed, uy * speed)
 
                 tr = MotionTracker(self.s("vel_window_s"))
@@ -464,6 +496,14 @@ class StopLatencyDiagnostic(Diagnostic):
                 s_mv, ok = self._poll_until(robot, is_moving,
                                             timeout=self.s("max_run_s"),
                                             stop=stop, tracker=tr)
+                if self._emergency_seen(robot):
+                    skipped += 1
+                    self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+                    log(f"  trial {i + 1}: boundary guard stopped the robot "
+                        f"(moving too fast / drifting) — skipped"
+                        + self._explain_no_motion(robot))
+                    self._settle(robot, log, stop)
+                    continue
                 if not ok:
                     skipped += 1
                     self.cmd.stop_robot(robot.is_yellow, robot.robot_id)

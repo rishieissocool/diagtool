@@ -59,6 +59,8 @@ class VisionSource:
         self._last_frame_no: int | None = None
         self._drops = 0
         self._dupes = 0
+        self._field_length: int | None = None   # mm, from SSL-Vision geometry
+        self._field_width: int | None = None     # mm
         self._sent_latency: list[float] = []      # ms, recv_wall - t_sent
         self._capture_latency: list[float] = []    # ms, recv_wall - t_capture
         self.error: str | None = None
@@ -109,9 +111,22 @@ class VisionSource:
             try:
                 if pkt.HasField("detection"):
                     self._on_detection(pkt.detection)
+                if pkt.HasField("geometry"):
+                    self._on_geometry(pkt.geometry)
             except Exception:
                 # malformed packet — ignore, keep listening
                 continue
+
+    def _on_geometry(self, geo) -> None:
+        f = getattr(geo, "field", None)
+        if f is None:
+            return
+        fl = int(getattr(f, "field_length", 0) or 0)
+        fw = int(getattr(f, "field_width", 0) or 0)
+        if fl > 0 and fw > 0:
+            with self._lock:
+                self._field_length = fl
+                self._field_width = fw
 
     def _on_detection(self, det) -> None:
         t_perf = time.perf_counter()
@@ -171,6 +186,14 @@ class VisionSource:
         with self._lock:
             return sorted(self._poses.keys())
 
+    def field_size(self) -> tuple[int, int] | None:
+        """(field_length_mm, field_width_mm) from SSL-Vision geometry, or None
+        if no geometry packet has been received yet."""
+        with self._lock:
+            if self._field_length and self._field_width:
+                return (self._field_length, self._field_width)
+        return None
+
     @property
     def fps(self) -> float:
         return self._frames.rate_hz
@@ -189,6 +212,8 @@ class VisionSource:
                 "capture_latency_ms": summarize(self._capture_latency, "ms"),
                 "visible": len(self._poses),
                 "age_s": self._frames.age(),
+                "field_length": self._field_length,
+                "field_width": self._field_width,
             }
 
 

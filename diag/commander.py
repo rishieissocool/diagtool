@@ -65,14 +65,25 @@ class Target:
     send_errors: int = 0
     zeroed_no_pose: int = 0
     zeroed_safety: int = 0
+    zeroed_emergency: int = 0
     last_error: str | None = None
+    # measured velocity from vision (mm/s, lightly smoothed) — drives the
+    # predictive emergency stop, which is immune to speed_scale / drift bugs
+    meas_vx: float = 0.0
+    meas_vy: float = 0.0
+    _vref_x: float = 0.0
+    _vref_y: float = 0.0
+    _vref_t: float = 0.0
+    _vref_frame: int = -1
 
 
 class Commander:
     def __init__(self, vision: VisionSource, sender_ip: str | None = None,
                  send_hz: float = 50.0, pose_max_age: float = 0.4,
                  drive_grace: float = 0.5, lim: safety.Limits | None = None,
-                 blind_speed: float = 0.25):
+                 blind_speed: float = 0.25, safety_reaction_s: float = 0.6,
+                 safety_decel_mm_s2: float = 250.0, safety_factor: float = 1.5,
+                 safety_max_speed_mm_s: float = 600.0):
         Sender, RobotCommand = bridge.get_command_classes()
         self._RobotCommand = RobotCommand
         self._sender = Sender(device_ip=sender_ip) if sender_ip else Sender(device_ip=None)
@@ -86,6 +97,13 @@ class Commander:
         self._blind_speed = max(0.0, float(blind_speed))
         # arena-aware limits (shared with the engine/diagnostics)
         self._lim = lim or safety.limits()
+        # predictive emergency-stop model (uses MEASURED vision velocity):
+        #   stop_dist(v) = factor * (reaction * v + v^2 / (2*decel))
+        # tuned conservative from real coast/latency measurements.
+        self._safety_reaction = max(0.0, float(safety_reaction_s))
+        self._safety_decel = max(1.0, float(safety_decel_mm_s2))
+        self._safety_factor = max(1.0, float(safety_factor))
+        self._safety_max_speed = max(0.0, float(safety_max_speed_mm_s))
 
         self._targets: dict[tuple[bool, int], Target] = {}
         self._lock = threading.Lock()
@@ -111,6 +129,11 @@ class Commander:
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
+
+    def set_limits(self, lim: safety.Limits) -> None:
+        """Swap in new arena limits (e.g. after vision reports the field size).
+        Takes effect on the next send."""
+        self._lim = lim
 
     # -- target management --
     def register(self, is_yellow: bool, robot_id: int, ip: str, port: int) -> Target:
@@ -172,6 +195,8 @@ class Commander:
                 "send_errors": t.send_errors,
                 "zeroed_no_pose": t.zeroed_no_pose,
                 "zeroed_safety": t.zeroed_safety,
+                "zeroed_emergency": t.zeroed_emergency,
+                "meas_speed_mm_s": round(math.hypot(t.meas_vx, t.meas_vy), 1),
                 "last_sent": t.last_sent,
                 "last_blocked": t.last_blocked,
                 "last_error": t.last_error,
@@ -186,7 +211,7 @@ class Commander:
             t = self._targets.get((bool(is_yellow), int(robot_id)))
             if t:
                 t.sends = t.send_errors = 0
-                t.zeroed_no_pose = t.zeroed_safety = 0
+                t.zeroed_no_pose = t.zeroed_safety = t.zeroed_emergency = 0
                 t.last_error = None
 
     # -- thread body --
@@ -207,6 +232,51 @@ class Commander:
         for t in targets:
             self._send_one(t)
 
+    def _stop_distance(self, speed_mm_s: float) -> float:
+        """Conservative distance (mm) to fully stop from `speed_mm_s`, including
+        command-latency reaction and coast (decel model), times a safety factor."""
+        coast = (speed_mm_s * speed_mm_s) / (2.0 * self._safety_decel)
+        return self._safety_factor * (self._safety_reaction * speed_mm_s + coast)
+
+    def _emergency_stop(self, pose, vx: float, vy: float) -> bool:
+        """True if the robot's MEASURED motion is unsafe and must be cut now.
+
+        Independent of the commanded velocity, so it catches a robot that moves
+        far faster than commanded (speed_scale bug) or drifts sideways: if it is
+        moving too fast outright, or its real stopping distance would carry it
+        past the arena edge on either axis, stop.
+        """
+        lim = self._lim
+        if self._safety_max_speed > 0 and math.hypot(vx, vy) > self._safety_max_speed:
+            return True
+        x, y = pose[0], pose[1]
+        for p, v, bound in ((x, vx, lim.arena_half_len), (y, vy, lim.arena_half_wid)):
+            if v > 5.0:
+                room = bound - p
+            elif v < -5.0:
+                room = bound + p
+            else:
+                continue
+            if room <= 0.0 or self._stop_distance(abs(v)) >= room:
+                return True
+        return False
+
+    def _update_velocity(self, t: Target, sample) -> None:
+        """Estimate the robot's world-frame velocity (mm/s) from vision frames."""
+        fn = int(sample.frame_number)
+        if fn == t._vref_frame:
+            return
+        if t._vref_t > 0.0:
+            dt = sample.t_perf - t._vref_t
+            if dt > 1e-3:
+                nvx = (sample.x - t._vref_x) / dt
+                nvy = (sample.y - t._vref_y) / dt
+                a = 0.5                           # light smoothing
+                t.meas_vx = a * nvx + (1 - a) * t.meas_vx
+                t.meas_vy = a * nvy + (1 - a) * t.meas_vy
+        t._vref_x, t._vref_y = sample.x, sample.y
+        t._vref_t, t._vref_frame = sample.t_perf, fn
+
     def _send_one(self, t: Target) -> None:
         now = time.perf_counter()
         sample = self._vision.get_pose_sample(t.is_yellow, t.robot_id, max_age=None)
@@ -214,6 +284,7 @@ class Commander:
             pose = sample.pose()
             age = max(0.0, now - sample.t_perf)
             with self._lock:
+                self._update_velocity(t, sample)
                 t._last_pose = pose
                 t._last_pose_t = sample.t_perf
                 t.last_pose_age = age
@@ -248,6 +319,13 @@ class Commander:
                     drive_pose, t.vx, t.vy, t.w, self._lim)
             if blocked and want_motion:
                 reason = "safety"
+            # Predictive emergency stop on MEASURED motion — overrides the above
+            # and is what actually saves the robot when it moves far faster than
+            # commanded or drifts toward a wall.
+            if self._emergency_stop(drive_pose, t.meas_vx, t.meas_vy):
+                vx_r = vy_r = w = 0.0
+                blocked = True
+                reason = "emergency"
         elif not t.safe:
             # DIRECT mode, no pose: stream the command (comms/link test) but cap
             # it to a slow blind speed — we can't arena-guard what we can't see.
@@ -284,4 +362,6 @@ class Commander:
                 t.zeroed_no_pose += 1
             elif reason == "safety":
                 t.zeroed_safety += 1
+            elif reason == "emergency":
+                t.zeroed_emergency += 1
             t.rate.tick()

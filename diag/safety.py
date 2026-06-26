@@ -62,14 +62,21 @@ class Limits:
         return max(0.0, self.half_wid - self.safe_margin - self.boundary_inset)
 
 
-def limits(boundary_inset: float = 0.0, brake_zone: float = 400.0) -> Limits:
+def limits(boundary_inset: float = 0.0, brake_zone: float = 400.0,
+           half_len: float | None = None, half_wid: float | None = None) -> Limits:
+    """Build the limit set. `half_len`/`half_wid` (mm) override the field size
+    (e.g. from SSL-Vision geometry); when omitted, TeamControl's field_config
+    constants are used."""
     c = _consts()
-    half_len, half_wid = bridge.get_field_geometry()
+    if half_len is None or half_wid is None:
+        gl, gw = bridge.get_field_geometry()
+        half_len = gl if half_len is None else half_len
+        half_wid = gw if half_wid is None else half_wid
     return Limits(
         max_speed=float(c.MAX_SPEED),
         max_w=float(c.MAX_W),
-        half_len=half_len,
-        half_wid=half_wid,
+        half_len=float(half_len),
+        half_wid=float(half_wid),
         robot_radius=float(c.ROBOT_RADIUS),
         field_margin=float(c.FIELD_MARGIN),
         boundary_inset=max(0.0, float(boundary_inset)),

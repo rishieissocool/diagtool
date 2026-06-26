@@ -61,6 +61,24 @@ def _cmd_list(engine, args):
     return 0
 
 
+def _announce_field(engine, wait_s: float = 2.0):
+    """Start the engine, give SSL-Vision a moment to send geometry, then report
+    the field size that will bound the tests."""
+    engine.start()
+    end = time.time() + wait_s
+    while time.time() < end and engine.vision.field_size() is None:
+        time.sleep(0.1)
+    engine.refresh_field_geometry()
+    fi = engine.field_info()
+    _log(f"field: {fi['length_mm']:.0f} x {fi['width_mm']:.0f} mm "
+         f"(source: {fi['source']}); arena +/-{fi['arena_half_len_mm']:.0f} x "
+         f"+/-{fi['arena_half_wid_mm']:.0f} mm")
+    if fi["source"] == "field_config":
+        _log("[!] field size came from field_config constants (vision sent no "
+             "geometry and no field_length_mm/field_width_mm set) — verify it "
+             "matches your real field so robots stay off the walls.")
+
+
 def _warn_conflicts(engine, robots=None):
     conflicts = engine.ip_conflicts()
     if robots is not None:
@@ -80,6 +98,7 @@ def _cmd_probe(engine, args):
     move = float(args.move) if args.move else 0.0
     if move > 0:
         _log(f"[probe] direct nudge at {move:.2f} m/s — clear space around {r.label}.")
+    _announce_field(engine)
     res = engine.probe_robot(r, seconds=args.seconds, move_speed=move, log=_log)
     _log("")
     _log(f"probe {r.label} @ {res['ip']}:{res['port']} (id={res['robot_id']}): "
@@ -89,7 +108,7 @@ def _cmd_probe(engine, args):
 
 
 def _cmd_status(engine, args):
-    engine.start()
+    _announce_field(engine)
     secs = args.seconds
     _log(f"Sampling sources for {secs}s (Ctrl+C to stop early)...")
     end = time.time() + secs
@@ -117,6 +136,7 @@ def _run_tests(engine, robots, test_names, args):
     if not robots:
         _log("No robots selected. Use --robot Y0, --robots Y0,Y1, or --real.")
         return 2
+    _announce_field(engine)
     _warn_conflicts(engine, robots)
     ev, stop = _make_stop()
 

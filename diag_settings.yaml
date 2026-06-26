@@ -21,8 +21,12 @@ stopped_mm_s: 35.0       # speed below which the robot is "stopped"
 vel_window_s: 0.22       # window for the instantaneous velocity estimate
 
 # --- test commanded magnitudes ---
-test_speed_ms: 0.30      # linear speed for latency/stop/speed tests (m/s)
-test_w_rads: 0.25        # angular speed for the rotation test (rad/s)
+# Kept LOW on purpose: a miscalibrated robot can move several times faster than
+# commanded (measured speed_scale up to ~2.5x), so a small command keeps the
+# real speed and coast distance safe near walls. Raise only once the robot is
+# calibrated (speed_scale ~ 1.0).
+test_speed_ms: 0.12      # linear speed for latency/stop/speed tests (m/s)
+test_w_rads: 0.20        # angular speed for the rotation test (rad/s)
 
 # --- repetitions ---
 latency_trials: 6
@@ -39,10 +43,29 @@ max_travel_mm: 800.0     # hard cap: stop a run after the robot moves this far
 health_window_s: 6.0     # how long the health tests observe
 poll_s: 0.004            # vision poll period inside loops
 
+# --- field geometry (mm) ---
+# DiagTool reads the TRUE field size from the SSL-Vision geometry packet.
+# These explicit values are used as a safe fallback until vision reports it,
+# and as a hard cap (the arena never exceeds the smaller of vision vs these).
+# Set them to YOUR field. Leave blank/remove to rely purely on vision/config.
+field_length_mm: 4500    # x, goal line to goal line
+field_width_mm: 2230     # y, touchline to touchline
+
 # --- arena / wall safety (make tests stay well away from the walls) ---
 # The drive arena is the field minus the keep-off margin minus this inset.
 # Robots are actively braked to a stop at the arena edge and never cross it.
 # Bigger inset / brake_zone = safer (robots stay further in, slow down sooner).
-boundary_inset_mm: 500.0     # shrink the arena this far inside the keep-off margin
-brake_zone_mm: 400.0         # start decelerating this far before the arena edge
+boundary_inset_mm: 250.0     # shrink the arena this far inside the keep-off margin
+brake_zone_mm: 300.0         # start decelerating this far before the arena edge
 direct_blind_speed_ms: 0.25  # speed cap for direct/jog moves with NO vision
+
+# --- predictive emergency stop (the real wall-protection) ---
+# Watches the robot's ACTUAL velocity from vision and cuts the command the
+# moment its real stopping distance would breach the arena — so it works even
+# when the robot moves much faster than commanded or coasts/drifts a long way.
+# Defaults are tuned conservatively from measured coast (~1.2 m) and latency
+# (~0.5 s). Make decel smaller or factor/reaction bigger for an earlier stop.
+safety_reaction_s: 0.6        # assumed delay before a stop takes effect (s)
+safety_decel_mm_s2: 250.0     # assumed braking deceleration (mm/s^2)
+safety_factor: 1.5            # extra margin multiplier on stopping distance
+safety_max_speed_mm_s: 600.0  # hard cut if the robot is actually moving faster

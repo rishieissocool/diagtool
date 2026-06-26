@@ -54,6 +54,33 @@ class RobotInfo:
         return RobotRef(self.is_yellow, self.robot_id, self.ip, self.port)
 
 
+def resolve_field_half(vision_size, setting_len, setting_wid, config_half):
+    """Most-conservative real field half-extents -> (half_len, half_wid, source).
+
+    Prefers real dimensions (SSL-Vision geometry, or an explicit override in
+    diag_settings.yaml) over TeamControl's field_config constants, which can be
+    wrong for a given arena. When several real sources are present, the SMALLER
+    on each axis wins, so the arena never exceeds the true field.
+
+      vision_size  : (length_mm, width_mm) from SSL-Vision, or None
+      setting_len  : explicit field_length_mm, or None
+      setting_wid  : explicit field_width_mm, or None
+      config_half  : (half_len, half_wid) fallback from field_config
+    """
+    lens, wids, srcs = [], [], []
+    if vision_size and vision_size[0] > 0 and vision_size[1] > 0:
+        lens.append(vision_size[0] / 2.0)
+        wids.append(vision_size[1] / 2.0)
+        srcs.append("vision")
+    if setting_len and setting_wid and float(setting_len) > 0 and float(setting_wid) > 0:
+        lens.append(float(setting_len) / 2.0)
+        wids.append(float(setting_wid) / 2.0)
+        srcs.append("settings")
+    if lens:
+        return min(lens), min(wids), "+".join(srcs)
+    return float(config_half[0]), float(config_half[1]), "field_config"
+
+
 def ip_conflicts(robots) -> dict:
     """Real robots that share an IP -> {ip: [labels]}.
 
@@ -86,16 +113,16 @@ class Engine:
     def __init__(self, settings: dict | None = None):
         self.config = bridge.get_config()
         self.settings = settings or load_settings()
-        self.lim = safety.limits(
-            boundary_inset=float(self.settings.get("boundary_inset_mm",
-                                                   DEFAULTS["boundary_inset_mm"])),
-            brake_zone=float(self.settings.get("brake_zone_mm",
-                                               DEFAULTS["brake_zone_mm"])))
 
         self.vision = VisionSource(port=int(self.config.vision[1]))
         self.telemetry = TelemetrySource(self.config)
         self.commander: Commander | None = None
         self._started = False
+
+        # Field size is resolved (vision geometry / settings / config) into the
+        # arena limits; refreshed live once vision sends a geometry packet.
+        self._field_source = None
+        self.lim = self._build_limits()
 
     # -- robot inventory --
     def robots(self, real_only: bool = False) -> list[RobotInfo]:
@@ -123,6 +150,45 @@ class Engine:
     def ip_conflicts(self) -> dict:
         """Real robots sharing an IP (see module-level ip_conflicts())."""
         return ip_conflicts(self.robots())
+
+    # -- field geometry --
+    def _build_limits(self) -> safety.Limits:
+        vs = self.vision.field_size() if self.vision else None
+        half_len, half_wid, src = resolve_field_half(
+            vs, self.settings.get("field_length_mm"),
+            self.settings.get("field_width_mm"), bridge.get_field_geometry())
+        self._field_source = src
+        return safety.limits(
+            boundary_inset=float(self.settings.get("boundary_inset_mm",
+                                                   DEFAULTS["boundary_inset_mm"])),
+            brake_zone=float(self.settings.get("brake_zone_mm",
+                                               DEFAULTS["brake_zone_mm"])),
+            half_len=half_len, half_wid=half_wid)
+
+    def refresh_field_geometry(self) -> bool:
+        """Rebuild the arena from the latest field size (vision/settings).
+
+        Returns True if the field size changed (e.g. SSL-Vision geometry just
+        arrived); pushes the new limits to the commander so driving uses them.
+        """
+        new_lim = self._build_limits()
+        if (new_lim.half_len != self.lim.half_len or
+                new_lim.half_wid != self.lim.half_wid):
+            self.lim = new_lim
+            if self.commander is not None:
+                self.commander.set_limits(new_lim)
+            return True
+        return False
+
+    def field_info(self) -> dict:
+        lim = self.lim
+        return {
+            "length_mm": round(lim.half_len * 2, 1),
+            "width_mm": round(lim.half_wid * 2, 1),
+            "source": self._field_source,
+            "arena_half_len_mm": round(lim.arena_half_len, 1),
+            "arena_half_wid_mm": round(lim.arena_half_wid, 1),
+        }
 
     def probe_robot(self, robot: RobotInfo, seconds: float = 5.0,
                     move_speed: float = 0.0, log=None) -> dict:
@@ -218,6 +284,14 @@ class Engine:
             lim=self.lim,
             blind_speed=float(self.settings.get("direct_blind_speed_ms",
                                                 DEFAULTS["direct_blind_speed_ms"])),
+            safety_reaction_s=float(self.settings.get("safety_reaction_s",
+                                                      DEFAULTS["safety_reaction_s"])),
+            safety_decel_mm_s2=float(self.settings.get("safety_decel_mm_s2",
+                                                       DEFAULTS["safety_decel_mm_s2"])),
+            safety_factor=float(self.settings.get("safety_factor",
+                                                  DEFAULTS["safety_factor"])),
+            safety_max_speed_mm_s=float(self.settings.get("safety_max_speed_mm_s",
+                                                          DEFAULTS["safety_max_speed_mm_s"])),
         )
         # register every robot so the commander can drive any of them
         for r in self.robots():
