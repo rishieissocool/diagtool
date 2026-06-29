@@ -69,3 +69,16 @@ safety_reaction_s: 0.6        # assumed delay before a stop takes effect (s)
 safety_decel_mm_s2: 250.0     # assumed braking deceleration (mm/s^2)
 safety_factor: 1.5            # extra margin multiplier on stopping distance
 safety_max_speed_mm_s: 600.0  # hard cut if the robot is actually moving faster
+
+# --- battery gauge (GUI Competition/Robots tabs only — never affects driving) ---
+# The robots report raw battery voltage in telemetry; these map it to 0..100%.
+# Defaults are for a 6S LiPo (6 cells). For a 4S pack use ~16.8 / 13.2.
+battery_full_v: 25.2          # voltage drawn as 100%
+battery_empty_v: 19.8         # voltage drawn as 0%
+battery_warn_pct: 40.0        # gauge goes amber at/below this %
+battery_crit_pct: 15.0        # gauge goes red at/below this %
+
+# --- robots gallery (GUI Robots tab) ---
+# Folder holding robot photos named by label, e.g. Y0.png, B1.jpg. Leave blank
+# to use diag/ui/assets/robots. Robots with no photo get a drawn placeholder.
+robot_photo_dir:

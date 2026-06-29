@@ -190,6 +190,25 @@ def get_vision_classes():
     return Vision, Frame, Robot
 
 
+def get_grsim_factory():
+    """Return TeamControl's grSimPacketFactory (builds grSim command protobuf).
+
+    Used to drive robots inside grSim: it produces a `grSim_Packet` that the
+    simulator understands, which DiagTool sends to the grSim command address.
+    Requires the `protobuf` runtime (same as vision decoding).
+    """
+    ensure_on_path()
+    try:
+        from TeamControl.network.grSimPacketFactory import grSimPacketFactory
+    except ModuleNotFoundError as e:  # almost always google.protobuf
+        raise MissingDependency(
+            f"grSim command encoding needs the 'protobuf' package ({e}). "
+            "Install it into the same environment TeamControl uses:\n"
+            "    pip install protobuf"
+        ) from e
+    return grSimPacketFactory
+
+
 def get_onboard_classes():
     """Return (OnboardReceiver, OnboardObservationStore, parse_packet, build_ip_map)."""
     ensure_on_path()

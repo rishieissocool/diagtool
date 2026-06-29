@@ -9,6 +9,7 @@ a worker thread so the UI never freezes; the worker talks back over Qt signals.
 
 from __future__ import annotations
 
+import math
 import threading
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot, QTimer
@@ -16,13 +17,18 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QPlainTextEdit, QProgressBar, QTableWidget,
-    QTableWidgetItem, QGroupBox, QSplitter, QHeaderView, QMessageBox,
+    QTableWidgetItem, QGroupBox, QSplitter, QHeaderView, QMessageBox, QTabWidget,
 )
 
 from ..engine import Engine
 from ..diagnostics import ALL_DIAGNOSTICS
 from ..report import render_text
 from .field_view import FieldView
+from .overview_tab import OverviewTab
+from .robots_tab import RobotsTab
+from .drive_tab import DriveTab
+from .setup_tab import SetupTab
+from .theme import DARK_QSS
 
 
 _DOT_OK = "color:#46c25a; font-weight:bold;"
@@ -89,8 +95,8 @@ class MainWindow(QMainWindow):
     def __init__(self, engine: Engine):
         super().__init__()
         self.engine = engine
-        self.setWindowTitle("DiagTool — robot diagnostics & calibration")
-        self.resize(1180, 760)
+        self.setWindowTitle("DiagTool — competition dashboard, diagnostics & calibration")
+        self.resize(1280, 820)
 
         self._thread: QThread | None = None
         self._worker: Worker | None = None
@@ -126,7 +132,37 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs)
+
+        # Competition dashboard — battery + link + pose for every robot.
+        self.overview = OverviewTab(self._robots, self.engine.settings)
+        self.overview.robot_selected.connect(self._select_robot_label)
+        self.tabs.addTab(self.overview, "Competition")
+
+        # Robots gallery — a picture + live status per robot.
+        self.robots_tab = RobotsTab(self._robots, self.engine.settings)
+        self.robots_tab.robot_selected.connect(self._select_robot_label)
+        self.tabs.addTab(self.robots_tab, "Robots")
+
+        # Drive — move many robots at once (real + grSim).
+        self.drive_tab = DriveTab(self.engine)
+        self.tabs.addTab(self.drive_tab, "Drive")
+
+        # Setup — edit robot IP / port / target live.
+        self.setup_tab = SetupTab(self.engine, on_changed=self._on_config_changed)
+        self.tabs.addTab(self.setup_tab, "Setup")
+
+        # Diagnostics — the existing test battery, jog, sweep, self-test, log.
+        self._diag_tab_index = self.tabs.addTab(
+            self._build_diagnostics_tab(), "Diagnostics")
+
+    def _build_diagnostics_tab(self) -> QWidget:
+        tab = QWidget()
+        root = QVBoxLayout(tab)
 
         # top status bar
         bar = QHBoxLayout()
@@ -262,6 +298,7 @@ class MainWindow(QMainWindow):
 
         split.addWidget(right)
         split.setSizes([440, 740])
+        return tab
 
     # -- helpers --
     def _selected_robot(self):
@@ -274,6 +311,60 @@ class MainWindow(QMainWindow):
     def _on_select(self):
         r = self._selected_robot()
         self.field.set_selected(r.label if r else None)
+
+    def _select_robot_label(self, label: str):
+        """Select a robot from a Competition/Robots card and jump to its tests."""
+        row = self._row_by_label.get(label)
+        if row is not None:
+            self.tbl.selectRow(row)
+        if getattr(self, "_diag_tab_index", None) is not None:
+            self.tabs.setCurrentIndex(self._diag_tab_index)
+
+    def _on_config_changed(self):
+        """After a Setup-tab edit/reload: refresh the diagnostics table's IP /
+        DUP cells so every view shows the new addresses (cards update live from
+        the snapshot)."""
+        conflicts = self.engine.ip_conflicts()
+        for r in self.engine.robots():
+            row = self._row_by_label.get(r.label)
+            if row is None:
+                continue
+            ip_item = self.tbl.item(row, 1)
+            if ip_item is not None:
+                ip_item.setText(r.ip + ("  ⚠ DUP" if r.ip in conflicts else ""))
+        self._append_log("[setup] robot targets updated.")
+
+    def _collect_snapshot(self) -> dict:
+        """One self-contained snapshot of every robot's live state, fed to the
+        Competition + Robots tabs each tick (so those widgets never touch the
+        engine directly). Reads the live inventory so IP/target edits show up."""
+        conflicts = self.engine.ip_conflicts()
+        robots = []
+        for r in self.engine.robots():
+            s = self.engine.vision.get_pose_sample(
+                r.is_yellow, r.robot_id, max_age=0.5)
+            rs = self.engine.telemetry.robot_status(r.is_yellow, r.robot_id)
+            robots.append({
+                "label": r.label, "ip": r.ip,
+                "is_yellow": r.is_yellow, "is_real": r.is_real,
+                "dup": r.is_real and r.ip in conflicts,
+                "vision_seen": s is not None,
+                "x": s.x if s else None, "y": s.y if s else None,
+                "o_deg": math.degrees(s.o) if s else None,
+                "conf": s.confidence if s else None,
+                "tel_seen": bool(rs.get("seen")),
+                "rate_hz": rs.get("rate_hz"),
+                "tel_age": rs.get("age_s"),
+                "voltage": rs.get("voltage"),
+                "state": rs.get("state"),
+                "ball": rs.get("ball"),
+            })
+        return {
+            "robots": robots,
+            "vision": self.engine.vision.status(),
+            "telemetry": self.engine.telemetry.status(),
+            "field": self.engine.field_info(),
+        }
 
     def _busy(self, busy: bool):
         for b in self._test_btns:
@@ -452,6 +543,11 @@ class MainWindow(QMainWindow):
             rs = self.engine.telemetry.robot_status(r.is_yellow, r.robot_id)
             self.tbl.item(row, 4).setText("●" if rs.get("seen") else "—")
 
+        # push a fresh snapshot to the Competition + Robots tabs
+        snapshot = self._collect_snapshot()
+        self.overview.update_snapshot(snapshot)
+        self.robots_tab.update_snapshot(snapshot)
+
     def closeEvent(self, ev):
         self._timer.stop()
         self._jog_timer.stop()
@@ -470,6 +566,7 @@ def _short(result: dict) -> str:
 
 def launch(engine: Engine | None = None) -> int:
     app = QApplication.instance() or QApplication([])
+    app.setStyleSheet(DARK_QSS)
     eng = engine or Engine()
     win = MainWindow(eng)
     win.show()

@@ -43,6 +43,9 @@ class Target:
     robot_id: int
     ip: str
     port: int
+    mode: str = "real"          # "real" -> RobotCommand to ip:port (RobotFramework)
+                                # "grsim" -> grSim protobuf to the grSim address
+    grsim_id: int | None = None  # id used inside the grSim packet (defaults to robot_id)
     enabled: bool = False
     frame: str = "world"        # "world" | "body"
     safe: bool = True           # False -> send straight through (like the
@@ -83,10 +86,17 @@ class Commander:
                  drive_grace: float = 0.5, lim: safety.Limits | None = None,
                  blind_speed: float = 0.25, safety_reaction_s: float = 0.6,
                  safety_decel_mm_s2: float = 250.0, safety_factor: float = 1.5,
-                 safety_max_speed_mm_s: float = 600.0):
+                 safety_max_speed_mm_s: float = 600.0,
+                 grsim_addr: tuple[str, int] | None = None):
         Sender, RobotCommand = bridge.get_command_classes()
         self._RobotCommand = RobotCommand
         self._sender = Sender(device_ip=sender_ip) if sender_ip else Sender(device_ip=None)
+        # grSim command path (built lazily; needs protobuf). When set, targets in
+        # "grsim" mode are driven by sending a grSim packet here instead of a
+        # RobotCommand to their ip:port.
+        self._grsim_addr = (str(grsim_addr[0]), int(grsim_addr[1])) if grsim_addr else None
+        self._grsim_factory = None
+        self._grsim_error: str | None = None
         self._vision = vision
         self._period = 1.0 / send_hz
         self._pose_max_age = pose_max_age
@@ -135,13 +145,35 @@ class Commander:
         Takes effect on the next send."""
         self._lim = lim
 
+    def set_grsim_addr(self, addr: tuple[str, int] | None) -> None:
+        """Point the grSim command path at a new (ip, port) (e.g. after reload)."""
+        self._grsim_addr = (str(addr[0]), int(addr[1])) if addr else None
+
+    def _grsim_packet_factory(self):
+        """Lazily import grSimPacketFactory; cache the result (or the error)."""
+        if self._grsim_factory is None and self._grsim_error is None:
+            try:
+                self._grsim_factory = bridge.get_grsim_factory()
+            except Exception as e:
+                self._grsim_error = f"{type(e).__name__}: {e}"
+        return self._grsim_factory
+
     # -- target management --
-    def register(self, is_yellow: bool, robot_id: int, ip: str, port: int) -> Target:
+    def register(self, is_yellow: bool, robot_id: int, ip: str, port: int,
+                 mode: str = "real", grsim_id: int | None = None) -> Target:
         key = (bool(is_yellow), int(robot_id))
         with self._lock:
-            t = Target(bool(is_yellow), int(robot_id), ip, int(port))
+            t = Target(bool(is_yellow), int(robot_id), ip, int(port),
+                       mode=str(mode), grsim_id=grsim_id)
             self._targets[key] = t
             return t
+
+    def set_target_mode(self, is_yellow: bool, robot_id: int, mode: str) -> None:
+        """Switch a robot between 'real' (RobotCommand→ip:port) and 'grsim'."""
+        with self._lock:
+            t = self._targets.get((bool(is_yellow), int(robot_id)))
+            if t:
+                t.mode = str(mode)
 
     def enable(self, is_yellow: bool, robot_id: int, enabled: bool = True) -> None:
         with self._lock:
@@ -204,6 +236,7 @@ class Commander:
                 "send_rate_hz": round(t.rate.rate_hz, 1),
                 "ip": t.ip,
                 "port": t.port,
+                "mode": t.mode,
             }
 
     def reset_stats(self, is_yellow: bool, robot_id: int) -> None:
@@ -341,13 +374,30 @@ class Commander:
             if want_motion:
                 reason = "no_pose"
 
-        cmd = self._RobotCommand(
-            robot_id=t.robot_id, vx=vx_r, vy=vy_r, w=w,
-            kick=t.kick, dribble=t.dribble, isYellow=t.is_yellow)
+        # Transmit. Two wire formats, same body-frame velocity:
+        #   * "grsim" -> a grSim protobuf packet to the grSim command address
+        #     (the simulator's robots understand this),
+        #   * "real"  -> a RobotCommand string to the robot's ip:port (exactly
+        #     what RobotFramework parses).
         try:
-            self._sender.send(cmd, t.ip, t.port)
+            if t.mode == "grsim" and self._grsim_addr is not None:
+                factory = self._grsim_packet_factory()
+                if factory is None:
+                    raise RuntimeError(self._grsim_error or "grSim factory unavailable")
+                pkt = factory.robot_command(
+                    robot_id=(t.grsim_id if t.grsim_id is not None else t.robot_id),
+                    vx=vx_r, vy=vy_r, w=w,
+                    kick=bool(t.kick), dribble=bool(t.dribble),
+                    isYellow=t.is_yellow)
+                self._sender.send(pkt.SerializeToString(),
+                                  self._grsim_addr[0], self._grsim_addr[1])
+            else:
+                cmd = self._RobotCommand(
+                    robot_id=t.robot_id, vx=vx_r, vy=vy_r, w=w,
+                    kick=t.kick, dribble=t.dribble, isYellow=t.is_yellow)
+                self._sender.send(cmd, t.ip, t.port)
             sent_ok, err = True, None
-        except Exception as e:                      # bad address / unreachable
+        except Exception as e:                      # bad address / unreachable / no protobuf
             sent_ok, err = False, f"{type(e).__name__}: {e}"
 
         with self._lock:

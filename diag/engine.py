@@ -41,6 +41,8 @@ class RobotInfo:
     ip: str
     port: int
     key: str               # ipconfig letter (A..F)
+    grsim_id: int | None = None  # grSimID from ipconfig (for the grSim packet)
+    mode: str = "real"     # "real" -> RobotCommand to ip:port; "grsim" -> grSim
 
     @property
     def label(self) -> str:
@@ -52,6 +54,12 @@ class RobotInfo:
 
     def ref(self) -> RobotRef:
         return RobotRef(self.is_yellow, self.robot_id, self.ip, self.port)
+
+
+def default_mode_for(ip: str) -> str:
+    """A loopback robot is almost certainly running in grSim, so default it to the
+    grSim command path; a real LAN address defaults to the RobotFramework path."""
+    return "grsim" if (ip.startswith("127.") or ip == "localhost") else "real"
 
 
 def resolve_field_half(vision_size, setting_len, setting_wid, config_half):
@@ -119,13 +127,31 @@ class Engine:
         self.commander: Commander | None = None
         self._started = False
 
+        # grSim command address (ip, port) from ipconfig — where grSim-mode
+        # robots are driven.
+        self.grsim_addr = self._read_grsim_addr()
+
+        # The robot inventory is owned (not rebuilt from config on every call) so
+        # IP/port/target edits made in the UI persist and the same RobotInfo
+        # objects stay valid across the app.
+        self._inventory: list[RobotInfo] = self._build_inventory()
+
         # Field size is resolved (vision geometry / settings / config) into the
         # arena limits; refreshed live once vision sends a geometry packet.
         self._field_source = None
         self.lim = self._build_limits()
 
     # -- robot inventory --
-    def robots(self, real_only: bool = False) -> list[RobotInfo]:
+    def _read_grsim_addr(self) -> tuple[str, int] | None:
+        addr = getattr(self.config, "grSim_addr", None)
+        try:
+            if addr:
+                return (str(addr[0]), int(addr[1]))
+        except Exception:
+            pass
+        return None
+
+    def _build_inventory(self) -> list[RobotInfo]:
         out: list[RobotInfo] = []
         for is_yellow, team in ((True, getattr(self.config, "yellow", {})),
                                 (False, getattr(self.config, "blue", {}))):
@@ -133,19 +159,95 @@ class Engine:
                 sid = d.get("shellID")
                 if sid is None:
                     continue
-                info = RobotInfo(bool(is_yellow), int(sid),
-                                 str(d.get("ip", "127.0.0.1")),
-                                 int(d.get("port", 50514)), str(key))
-                if real_only and not info.is_real:
-                    continue
-                out.append(info)
+                ip = str(d.get("ip", "127.0.0.1"))
+                gid = d.get("grSimID")
+                out.append(RobotInfo(
+                    bool(is_yellow), int(sid), ip,
+                    int(d.get("port", 50514)), str(key),
+                    grsim_id=(int(gid) if gid is not None else None),
+                    mode=default_mode_for(ip)))
         return out
 
+    def robots(self, real_only: bool = False) -> list[RobotInfo]:
+        if real_only:
+            return [r for r in self._inventory if r.is_real]
+        return list(self._inventory)
+
     def find_robot(self, label: str) -> RobotInfo | None:
-        for r in self.robots():
+        for r in self._inventory:
             if r.label.lower() == label.lower():
                 return r
         return None
+
+    # -- live reconfiguration --
+    def set_robot_target(self, label: str, ip: str | None = None,
+                         port: int | None = None, mode: str | None = None) -> RobotInfo | None:
+        """Change a robot's IP / port / target (real|grsim) and apply it live.
+
+        Re-registers the commander target so the very next command stream uses
+        the new address/protocol. Returns the updated RobotInfo (the same object
+        the rest of the app holds), or None if the label is unknown.
+        """
+        r = self.find_robot(label)
+        if r is None:
+            return None
+        if ip is not None:
+            r.ip = str(ip).strip()
+        if port is not None:
+            r.port = int(port)
+        if mode is not None:
+            r.mode = "grsim" if str(mode).lower().startswith("g") else "real"
+        if self.commander is not None:
+            self.commander.register(r.is_yellow, r.robot_id, r.ip, r.port,
+                                    mode=r.mode, grsim_id=r.grsim_id)
+        return r
+
+    def reload_config(self) -> dict:
+        """Re-read ipconfig.yaml from disk and apply it live.
+
+        Updates each known robot's ip/port/grsim_id in place (so labels stay
+        stable for the UI) and re-registers commander targets. Returns a summary
+        of what changed.
+        """
+        self.config = bridge.get_config()
+        self.grsim_addr = self._read_grsim_addr()
+        fresh = {r.label: r for r in self._build_inventory()}
+        changed, added, removed = [], [], []
+        have = {r.label for r in self._inventory}
+        for label, nr in fresh.items():
+            cur = self.find_robot(label)
+            if cur is None:
+                self._inventory.append(nr)
+                added.append(label)
+            else:
+                if (cur.ip, cur.port) != (nr.ip, nr.port):
+                    changed.append(label)
+                cur.ip, cur.port, cur.grsim_id = nr.ip, nr.port, nr.grsim_id
+                cur.mode = nr.mode
+        removed = [l for l in have if l not in fresh]
+        if self.commander is not None:
+            self.commander.set_grsim_addr(self.grsim_addr)
+            for r in self._inventory:
+                self.commander.register(r.is_yellow, r.robot_id, r.ip, r.port,
+                                        mode=r.mode, grsim_id=r.grsim_id)
+        return {"changed": changed, "added": added, "removed": removed}
+
+    def save_config(self, path: Path | None = None) -> Path:
+        """Write the current inventory's IP/port back into ipconfig.yaml.
+
+        Loads the raw YAML, updates each robot's ip/port by its team+letter so
+        every other key is preserved, and writes it back. Returns the path.
+        """
+        cfg_path = Path(path) if path else bridge.local_config_path("ipconfig.yaml")
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        for r in self._inventory:
+            team = "yellow" if r.is_yellow else "blue"
+            section = raw.setdefault(team, {})
+            entry = section.setdefault(r.key, {})
+            entry["ip"] = r.ip
+            entry["port"] = int(r.port)
+        cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        return cfg_path
 
     def ip_conflicts(self) -> dict:
         """Real robots sharing an IP (see module-level ip_conflicts())."""
@@ -292,10 +394,13 @@ class Engine:
                                                   DEFAULTS["safety_factor"])),
             safety_max_speed_mm_s=float(self.settings.get("safety_max_speed_mm_s",
                                                           DEFAULTS["safety_max_speed_mm_s"])),
+            grsim_addr=self.grsim_addr,
         )
-        # register every robot so the commander can drive any of them
+        # register every robot so the commander can drive any of them, each with
+        # its target protocol (real ip:port, or the grSim command address)
         for r in self.robots():
-            self.commander.register(r.is_yellow, r.robot_id, r.ip, r.port)
+            self.commander.register(r.is_yellow, r.robot_id, r.ip, r.port,
+                                    mode=r.mode, grsim_id=r.grsim_id)
         self.commander.start()
         self._started = True
 

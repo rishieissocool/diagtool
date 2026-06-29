@@ -222,7 +222,55 @@ class VisionSource:
 @dataclass
 class TelemetryState:
     obs: object = None                 # latest OnboardObservation
+    voltage: float | None = None       # battery volts (parsed by DiagTool, see below)
+    state: str | None = None           # robot state string, if the packet carries one
     rate: RateMeter = field(default_factory=lambda: RateMeter(window=120))
+
+
+# The vendored TeamControl OnboardObservation carries the ball reading but not
+# the battery voltage / robot state, even though the telemetry packets include
+# them (RobotFramework sends e.g. `state=active,voltage=22.8,ball=1,...`). We
+# must not modify the vendored copy, so DiagTool pulls those two extra fields
+# out of the raw packet itself — purely additive, never touching the vendored
+# parse used for everything else.
+_VOLT_KEYS = ("voltage", "battery voltage", "battery", "vbat", "v")
+_STATE_KEYS = ("state", "robot state", "status")
+
+
+def parse_battery_state(payload) -> tuple[float | None, str | None]:
+    """Best-effort (voltage_volts, state_str) from a raw telemetry packet.
+
+    Mirrors the vendored parser's tokenising (`,`-separated, `=` or `:` inside a
+    token) but only looks for the battery voltage and a state label. Returns
+    (None, None) when the packet carries neither, so it is safe on every packet.
+    """
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            payload = payload.decode("utf-8", errors="replace")
+        except Exception:
+            return None, None
+    if not isinstance(payload, str) or ("=" not in payload and ":" not in payload):
+        return None, None
+
+    voltage: float | None = None
+    state: str | None = None
+    for token in payload.strip().split(","):
+        if "=" in token:
+            k, v = token.split("=", 1)
+        elif ":" in token:
+            k, v = token.split(":", 1)
+        else:
+            continue
+        key = " ".join(k.strip().lower().split())
+        val = v.strip()
+        if voltage is None and key in _VOLT_KEYS:
+            try:
+                voltage = float(val)
+            except ValueError:
+                pass
+        elif state is None and key in _STATE_KEYS:
+            state = val or None
+    return voltage, state
 
 
 class TelemetrySource:
@@ -304,6 +352,8 @@ class TelemetrySource:
                 self.unattributed += 1
                 continue
 
+            volt, state = parse_battery_state(data)
+
             key = (bool(obs.is_yellow), int(obs.robot_id))
             with self._lock:
                 st = self._by_robot.get(key)
@@ -311,6 +361,10 @@ class TelemetrySource:
                     st = TelemetryState()
                     self._by_robot[key] = st
                 st.obs = obs
+                if volt is not None:
+                    st.voltage = volt
+                if state is not None:
+                    st.state = state
                 st.rate.tick(t_perf)
                 self._all.tick(t_perf)
                 self.packets += 1
@@ -326,12 +380,19 @@ class TelemetrySource:
             if st is None:
                 return {"seen": False}
             obs = st.obs
+            # Prefer the voltage/state DiagTool pulled from the raw packet; fall
+            # back to the obs attributes in case a future vendored obs carries them.
+            voltage = st.voltage
+            if voltage is None and obs is not None:
+                voltage = getattr(obs, "voltage", None)
             return {
                 "seen": True,
                 "rate_hz": round(st.rate.rate_hz, 3),
                 "age_s": st.rate.age(),
                 "interval_ms": st.rate.interval_stats("ms"),
-                "voltage": getattr(obs, "voltage", None) if obs else None,
+                "voltage": voltage,
+                "state": st.state if st.state is not None
+                else (getattr(obs, "state", None) if obs else None),
                 "ball": getattr(obs, "found", None) if obs else None,
                 "robot_ts_ms": getattr(obs, "robot_ts_ms", None) if obs else None,
             }

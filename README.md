@@ -121,18 +121,57 @@ points at the real `192.168.1.x` addresses, not `127.0.0.1`.)
 ```
 python run_diag.py
 ```
-Pick a robot, then:
-* **Manual jog** — Forward / Back / Left / Right / Turn buttons drive the
-  selected robot in short 0.5 s pulses (direct send, body frame) so you can
-  *see* it move and confirm the link before measuring anything. **■ STOP** halts
-  the jog.
-* **▶ Probe + Run All Tests** — one click: streams a heartbeat and checks the
-  robot is reachable (probe verdict shown on top of the report), then runs the
-  whole battery on that robot.
-* Individual diagnostic buttons, **Run Full Sweep** (all real robots), and the
-  red **STOP** which aborts immediately.
+The dashboard has three tabs:
 
-Duplicate-IP robots are flagged in the table (`⚠ DUP`) and the log.
+* **Competition** — a live, glanceable wall of cards, one per robot, for use
+  *during a match*: **battery gauge** (voltage → %, green/amber/red), vision and
+  telemetry link (with telemetry rate), ball-in-dribbler, position/heading and
+  robot state. The whole card tints by health so a robot that goes dark, loses
+  its link, or runs low on battery jumps out without reading numbers. A summary
+  header shows robots online, low batteries, vision fps, telemetry rate and the
+  resolved field size. Click any card to jump to that robot's tests.
+* **Robots** — a gallery with a **picture of every robot** plus its online state
+  and battery. Drop real photos into `diag/ui/assets/robots/` named by label
+  (`Y0.png`, `B1.jpg`, …) and they replace the drawn placeholders automatically
+  (or point `robot_photo_dir` in `diag_settings.yaml` at another folder).
+* **Drive** — move **many robots at once**. Pick a scope (all / a team / just the
+  grSim robots / just the real ones), set the speed, and **hold** a direction
+  button to drive every robot in scope; release or **STOP ALL** to halt. Each
+  robot is driven through its own target (grSim packet or RobotCommand), so the
+  same pad works in the simulator and on the field. Any robot vision can see is
+  still arena-braked and emergency-stopped.
+* **Setup** — edit each robot's **IP / port / target (real vs grSim) live**.
+  Change a value and **Apply**: the running command stream switches to the new
+  address immediately, no restart. **Reload from file** re-reads `ipconfig.yaml`;
+  **Save to file** writes the table back to it.
+* **Diagnostics** — the full test battery, manual jog, sweep and self-test:
+
+  * **Manual jog** — Forward / Back / Left / Right / Turn buttons drive the
+    selected robot in short 0.5 s pulses (direct send, body frame) so you can
+    *see* it move and confirm the link before measuring anything. **■ STOP**
+    halts the jog.
+  * **▶ Probe + Run All Tests** — one click: streams a heartbeat and checks the
+    robot is reachable (probe verdict shown on top of the report), then runs the
+    whole battery on that robot.
+  * Individual diagnostic buttons, **Run Full Sweep** (all real robots), and the
+    red **STOP** which aborts immediately.
+
+Duplicate-IP robots are flagged in the table (`⚠ DUP`), on the Competition cards
+and in the log.
+
+> **Battery gauge.** The robots report raw battery voltage in their telemetry;
+> the gauge maps it to 0–100 % using `battery_full_v` / `battery_empty_v` in
+> `diag_settings.yaml` (defaults are for a **6S LiPo**: 25.2 V full, 19.8 V
+> empty). For a 4S pack use ~16.8 / 13.2. It is display-only and never affects
+> driving.
+
+> **grSim vs real robots.** Each robot has a *target*: a **real** robot is driven
+> with a `RobotCommand` to its `ip:port` (exactly what RobotFramework parses); a
+> **grSim** robot is driven with a grSim command packet sent to the grSim address
+> (`grSim:` in `ipconfig.yaml`, default `127.0.0.1:20011`). A robot on a loopback
+> IP (`127.0.0.1`) defaults to **grSim**, a LAN IP defaults to **real** — flip
+> any robot in the **Setup** tab. So to test in grSim: start grSim, leave the sim
+> robots on `127.0.0.1`, open the **Drive** tab, scope to *Sim (grSim)* and drive.
 
 ### CLI (headless / over SSH)
 ```
@@ -253,4 +292,13 @@ diagtool/
     cli.py               headless front-end
     selftest.py          offline self-test (unit + simulated sweep)
     ui/                  PySide6 dashboard
+      main_window.py     tabbed window (Competition·Robots·Drive·Setup·Diagnostics)
+      overview_tab.py    competition dashboard — live battery/link cards
+      robots_tab.py      robot gallery — pictures + status per robot
+      drive_tab.py       multi-robot movement (real + grSim)
+      setup_tab.py       live IP/port/target editor
+      widgets.py         battery gauge, robot pixmaps, shared cards
+      field_view.py      top-down field canvas
+      theme.py           dark stylesheet
+      assets/robots/     drop <LABEL>.png robot photos here (optional)
 ```

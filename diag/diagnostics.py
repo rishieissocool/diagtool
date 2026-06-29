@@ -76,6 +76,15 @@ DEFAULTS = {
     "safety_decel_mm_s2": 250.0,   # assumed braking decel (lower = safer/earlier)
     "safety_factor": 1.5,          # extra margin on the stopping distance
     "safety_max_speed_mm_s": 600.0,# hard cap: stop if actually moving faster
+    # --- battery gauge (telemetry voltage -> %); UI only, no effect on driving ---
+    "battery_full_v": 25.2,        # voltage shown as 100% (6S LiPo: 6 x 4.20 V)
+    "battery_empty_v": 19.8,       # voltage shown as 0%   (6S LiPo: 6 x 3.30 V)
+    "battery_warn_pct": 40.0,      # gauge turns amber at/below this %
+    "battery_crit_pct": 15.0,      # gauge turns red at/below this %
+    # --- robots gallery ---
+    "robot_photo_dir": None,       # folder of <LABEL>.png robot photos (e.g. Y0.png);
+                                   # None -> diag/ui/assets/robots. Missing photos
+                                   # fall back to a drawn placeholder.
 }
 
 
