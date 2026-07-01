@@ -13,7 +13,10 @@ It exercises, in layers:
   * diagnostics    — motion math (MotionTracker, angle unwrap, geometry)
   * safety         — wall-aware velocity limiting (synthetic + real constants)
   * config/engine  — ipconfig parsing + robot inventory
+  * sources        — telemetry battery/state parsing, pose sample shape
+  * bridge         — optional-dependency probes (protobuf / PySide6), paths
   * wiring         — Engine.start()/stop() on local sockets (tolerant)
+  * commander      — the real send path, arena guard, emergency stop
   * simulated sweep — the REAL Diagnostic classes driven against a fake
                       vision+commander robot model, with shrunk timings, so the
                       whole measurement pipeline runs end-to-end offline.
@@ -22,9 +25,12 @@ Each check is PASS / FAIL / SKIP. SKIP means an optional dependency or the
 environment was missing (not a defect) — e.g. protobuf absent, or a UDP port
 already in use. The process exits non-zero only when something FAILs.
 
+Checks are independent, so run_selftest() fans them out over a small thread
+pool instead of running one at a time — more checks land in less wall time.
+
 Run:
     python run_diag.py --cli selftest
-    python run_diag.py --cli selftest --no-sim     # skip the ~8s sim sweep
+    python run_diag.py --cli selftest --no-sim     # skip the sim sweep
     python -m diag.selftest
 """
 
@@ -32,8 +38,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import bridge, safety
@@ -45,6 +53,7 @@ from .diagnostics import (
     MotionTracker, _unwrap, _ang_diff, _centered,
     DiagContext, RobotRef, BY_NAME, DEFAULTS,
 )
+from . import sources
 from .sources import PoseSample
 
 
@@ -172,6 +181,40 @@ def welford_matches_population_std():
     assert approx(w.std, 2.0)
 
 
+@_test("metrics")
+def summarize_single_sample_has_zero_spread():
+    s = summarize([7.0], "ms")
+    assert s["n"] == 1
+    assert s["mean"] == s["median"] == s["min"] == s["max"] == 7.0
+    assert approx(s["std"], 0.0)
+    assert approx(s["p05"], 7.0) and approx(s["p95"], 7.0)
+
+
+@_test("metrics")
+def percentile_interpolates_between_points():
+    # [0, 10]: 25th percentile sits a quarter of the way from 0 to 10
+    assert approx(metrics_mod._percentile([0.0, 10.0], 25.0), 2.5)
+    assert approx(metrics_mod._percentile([0.0, 10.0], 75.0), 7.5)
+
+
+@_test("metrics")
+def ratemeter_window_trims_old_samples():
+    rm = RateMeter(window=5)
+    for i in range(20):
+        rm.tick(float(i))
+    assert rm.total == 20                              # lifetime count keeps growing
+    assert len(rm._ts) == 5                             # but the window is bounded
+    assert rm.last_ts == 19.0
+
+
+@_test("metrics")
+def welford_single_sample_has_zero_std():
+    w = Welford()
+    w.add(42.0)
+    assert w.n == 1 and approx(w.mean, 42.0)
+    assert approx(w.std, 0.0)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 2. calibrator
 # ══════════════════════════════════════════════════════════════════════════
@@ -242,6 +285,39 @@ def build_calibration_indexes_by_label():
     assert set(cal["teamcontrol_format"]) == {"Y1", "B0"}
 
 
+@_test("calibrator")
+def summarize_robot_flags_spin_center_drift():
+    res = _good_results()
+    res["spin"] = {"w_scale": {"mean": 1.0}, "center_drift_mm": {"mean": 200.0},
+                   "spin_latency_ms": {"mean": 90.0}}
+    out = summarize_robot("Y1", res)
+    assert out["spin_center_drift_mm"] == 200.0
+    assert any("centre drift" in w for w in out["warnings"])
+
+
+@_test("calibrator")
+def summarize_robot_flags_spin_no_motion():
+    res = _good_results()
+    res["spin"] = {"no_motion_trials": 4, "trials": 4}
+    out = summarize_robot("Y1", res)
+    assert any("spin test saw NO rotation" in w for w in out["warnings"])
+
+
+@_test("calibrator")
+def summarize_robot_flags_boundary_guard_trips():
+    res = _good_results()
+    res["spin"] = {"boundary_guard_trips": 2}
+    out = summarize_robot("Y1", res)
+    assert any("boundary guard" in w for w in out["warnings"])
+
+
+@_test("calibrator")
+def round_helper_passes_none_through():
+    from .calibrator import _round
+    assert _round(None, 2) is None
+    assert approx(_round(1.23456, 2), 1.23)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 3. report (root-cause rules + render/write)
 # ══════════════════════════════════════════════════════════════════════════
@@ -261,6 +337,31 @@ def confirm_rules():
 
     assert report_mod._angular_freeze_confirm({"angular_no_motion": True}) == "confirmed"
     assert report_mod._angular_freeze_confirm({"angular_no_motion": False}) == "suspect"
+
+
+@_test("report")
+def speed_scale_confirm_boundary_values():
+    assert report_mod._speed_scale_confirm({"speed_scale": 0.7}) == "cleared"
+    assert report_mod._speed_scale_confirm({"speed_scale": 0.69}) == "confirmed"
+    assert report_mod._speed_scale_confirm({"speed_scale": 1.4}) == "cleared"
+    assert report_mod._speed_scale_confirm({"speed_scale": 1.41}) == "confirmed"
+
+
+@_test("report")
+def build_evidence_handles_empty_results():
+    ev = report_mod.build_evidence({}, {}, {})
+    assert ev["speed_scale"] is None
+    assert ev["telemetry_rate_hz"] is None
+    assert ev["vision_fps"] is None
+
+
+@_test("report")
+def suspects_all_cleared_when_evidence_is_healthy():
+    ev = {"telemetry_rate_hz": 60.0, "max_cmd_latency_ms": 40.0,
+          "speed_scale": 1.0, "angular_no_motion": False}
+    out = report_mod.analyze_suspects(ev)
+    statuses = {s["status"] for s in out}
+    assert "confirmed" not in statuses
 
 
 @_test("report")
@@ -339,9 +440,27 @@ def ang_diff_shortest():
 
 
 @_test("diagnostics-math")
+def ang_diff_zero_when_equal():
+    assert approx(_ang_diff(1.23, 1.23), 0.0)
+
+
+@_test("diagnostics-math")
 def centered_sums_to_zero():
     out = _centered([10.0, 12.0, 14.0])
     assert approx(sum(out), 0.0)
+
+
+@_test("diagnostics-math")
+def centered_handles_single_value():
+    out = _centered([5.0])
+    assert out == [0.0]
+
+
+@_test("diagnostics-math")
+def motion_tracker_not_ready_with_too_few_samples():
+    tr = MotionTracker(1.0)
+    tr.add(0.0, 0.0, 0.0, 0.0)
+    assert tr.ready is False
 
 
 @_test("diagnostics-math")
@@ -441,6 +560,34 @@ def safe_zone_and_wall_distance():
     assert safety.in_safe_zone(lim.half_len, 0.0, lim) is False
     assert approx(safety.nearest_wall_dist(0.0, 0.0, lim),
                   min(lim.half_len, lim.half_wid))
+
+
+@_test("safety")
+def nearest_wall_dist_picks_closer_axis():
+    lim = _SYNTH_LIM
+    # far from the +/-x walls, close to the +y wall -> y distance wins
+    d = safety.nearest_wall_dist(0.0, lim.half_wid - 50.0, lim)
+    assert approx(d, 50.0)
+
+
+@_test("safety")
+def guard_outward_world_blocks_y_axis_too():
+    lim = _SYNTH_LIM
+    y_near = lim.half_wid - lim.safe_margin + 1.0
+    gx, gy = safety.guard_outward_world(0.0, y_near, 0.0, 1.0, lim)
+    assert gy == 0.0                                    # pushing further out -> removed
+    gx, gy = safety.guard_outward_world(0.0, y_near, 0.0, -1.0, lim)
+    assert gy == -1.0                                   # pulling back in -> allowed
+
+
+@_test("safety")
+def safe_body_velocity_roundtrips_pure_forward():
+    lim = _SYNTH_LIM
+    # robot facing +90deg commanding "forward" in body frame -> world +y
+    vx_r, vy_r, w, blocked = safety.safe_body_velocity(
+        (0.0, 0.0, math.pi / 2), 0.3, 0.0, 0.0, lim)
+    assert approx(math.hypot(vx_r, vy_r), 0.3, 1e-6)
+    assert blocked is False
 
 
 # A tighter arena: 300mm extra inset, 200mm brake zone.
@@ -577,6 +724,14 @@ def real_pipeline_blocks_at_wall():
 # ══════════════════════════════════════════════════════════════════════════
 
 @_test("config/engine")
+def default_mode_for_grsim_vs_real():
+    from .engine import default_mode_for
+    assert default_mode_for("127.0.0.1") == "grsim"
+    assert default_mode_for("localhost") == "grsim"
+    assert default_mode_for("192.168.1.7") == "real"
+
+
+@_test("config/engine")
 def robotinfo_label_and_real():
     from .engine import RobotInfo
     r = RobotInfo(True, 1, "192.168.1.7", 50514, "B")
@@ -655,6 +810,66 @@ def engine_parses_ipconfig_inventory():
         assert eng.find_robot("does-not-exist") is None
     finally:
         eng.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6b. sources — pure telemetry/vision-sample parsing (no sockets)
+# ══════════════════════════════════════════════════════════════════════════
+
+@_test("sources")
+def parse_battery_state_comma_equals_form():
+    v, s = sources.parse_battery_state("state=active,voltage=22.8,ball=1")
+    assert approx(v, 22.8) and s == "active"
+
+
+@_test("sources")
+def parse_battery_state_colon_form():
+    v, s = sources.parse_battery_state("voltage:19.9, status:idle")
+    assert approx(v, 19.9) and s == "idle"
+
+
+@_test("sources")
+def parse_battery_state_bytes_payload():
+    v, s = sources.parse_battery_state(b"vbat=24.1,state=active")
+    assert approx(v, 24.1) and s == "active"
+
+
+@_test("sources")
+def parse_battery_state_no_recognisable_fields_returns_none():
+    v, s = sources.parse_battery_state("frame=17,ball=0")
+    assert v is None and s is None
+    v, s = sources.parse_battery_state("not a kv payload at all")
+    assert v is None and s is None
+
+
+@_test("sources")
+def parse_battery_state_bad_voltage_value_ignored():
+    v, s = sources.parse_battery_state("voltage=NOPE,state=active")
+    assert v is None and s == "active"                 # bad number skipped, state kept
+
+
+@_test("sources")
+def posesample_pose_returns_xyo_tuple():
+    p = PoseSample(x=1.0, y=2.0, o=0.5, confidence=1.0, frame_number=1,
+                   t_perf=0.0, t_wall=0.0, t_capture=0.0, t_sent=0.0)
+    assert p.pose() == (1.0, 2.0, 0.5)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6c. bridge — optional-dependency probes + path helpers (no TeamControl needed)
+# ══════════════════════════════════════════════════════════════════════════
+
+@_test("bridge")
+def have_protobuf_and_pyside6_return_plain_bools():
+    assert isinstance(bridge.have_protobuf(), bool)
+    assert isinstance(bridge.have_pyside6(), bool)
+
+
+@_test("bridge")
+def local_config_path_points_inside_repo():
+    p = bridge.local_config_path("ipconfig.yaml")
+    assert p.name == "ipconfig.yaml"
+    assert p.parent.is_dir()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1143,48 +1358,83 @@ def _run_one(fn):
         return "FAIL", f"{type(e).__name__}: {e}"
 
 
+def _timed_run_one(fn):
+    t0 = time.perf_counter()
+    status, detail = _run_one(fn)
+    return status, detail, time.perf_counter() - t0
+
+
 def run_selftest(log=None, include_sim: bool = True,
-                 include_net: bool = True, stop=None) -> dict:
-    """Run the whole suite. Returns a result dict; streams lines via `log`."""
+                 include_net: bool = True, stop=None,
+                 max_workers: int | None = None) -> dict:
+    """Run the whole suite concurrently on a thread pool. Returns a result
+    dict; streams one line per check via `log` as it completes, then a
+    grouped summary (incl. per-check timing and the parallel speedup).
+
+    Checks are independent (pure functions / isolated fakes / their own
+    temp dirs & sockets), so running them off a small thread pool cuts
+    total wall time by roughly the pool width with no change in coverage —
+    this is what makes "way more tests" and "faster" compatible.
+    """
     log = log or (lambda *a: None)
     stop = stop or (lambda: False)
 
-    results = []
-    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
-    section = None
+    tests = [t for t in _TESTS
+             if not (t[2] == "sim" and not include_sim)
+             and not (t[2] == "net" and not include_net)]
 
-    log("DiagTool self-test — offline, no robots required.")
-    for sec, name, tier, fn in _TESTS:
-        if stop():
-            log("\n[aborted]")
-            break
-        if tier == "sim" and not include_sim:
-            continue
-        if tier == "net" and not include_net:
-            continue
-        if sec != section:
-            log(f"\n-- {sec} " + "-" * max(0, 56 - len(sec)))
-            section = sec
-        status, detail = _run_one(fn)
+    if stop():
+        log("\n[aborted before start]")
+        return {"ok": False, "total": 0, "passed": 0, "failed": 0,
+                "skipped": 0, "results": [], "summary": "[aborted]"}
+
+    workers = max_workers or min(32, max(4, (os.cpu_count() or 4) * 4))
+    log(f"DiagTool self-test — offline, no robots required. "
+        f"Running {len(tests)} checks on up to {workers} threads...")
+
+    t_wall0 = time.perf_counter()
+    outcomes = {}                                        # idx -> (status, detail, dt)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_timed_run_one, fn): i
+                for i, (sec, name, tier, fn) in enumerate(tests)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            sec, name, tier, fn = tests[i]
+            try:
+                status, detail, dt = fut.result()
+            except Exception as e:                        # noqa: BLE001 — belt & braces
+                status, detail, dt = "FAIL", f"{type(e).__name__}: {e}", 0.0
+            outcomes[i] = (status, detail, dt)
+            line = f"  [{status}] {sec} :: {name}  ({dt * 1000:.0f} ms)"
+            if detail:
+                line += f"  -- {detail}"
+            log(line)
+    wall_elapsed = time.perf_counter() - t_wall0
+
+    results = []                                          # preserve declaration order
+    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+    timings = []
+    for i, (sec, name, tier, fn) in enumerate(tests):
+        status, detail, dt = outcomes[i]
         counts[status] += 1
         results.append((sec, name, status, detail))
-        line = f"  [{status}] {name}"
-        if detail:
-            line += f"  -- {detail}"
-        log(line)
+        timings.append((dt, sec, name))
 
     total = sum(counts.values())
     ok = counts["FAIL"] == 0
-    summary = _summary_text(counts, ok, results)
+    cpu_elapsed = sum(dt for dt, _, _ in timings)
+    summary = _summary_text(counts, ok, results, wall_elapsed, cpu_elapsed, timings)
     log("\n" + summary)
     return {
         "ok": ok, "total": total,
         "passed": counts["PASS"], "failed": counts["FAIL"],
         "skipped": counts["SKIP"], "results": results, "summary": summary,
+        "wall_s": wall_elapsed, "cpu_s": cpu_elapsed,
     }
 
 
-def _summary_text(counts, ok, results) -> str:
+def _summary_text(counts, ok, results, wall_elapsed=None, cpu_elapsed=None,
+                  timings=None) -> str:
     lines = ["=" * 64,
              f"  SELF-TEST: {counts['PASS']} passed, {counts['FAIL']} failed, "
              f"{counts['SKIP']} skipped",
@@ -1199,6 +1449,15 @@ def _summary_text(counts, ok, results) -> str:
         lines.append("  Skipped (optional dep / environment):")
         for s, n, d in skips:
             lines.append(f"    - {s} :: {n} -- {d}")
+    if wall_elapsed is not None:
+        speedup = (cpu_elapsed / wall_elapsed) if wall_elapsed > 0 else 1.0
+        lines.append(f"  {len(results)} checks in {wall_elapsed:.2f}s wall-clock "
+                     f"({cpu_elapsed:.2f}s sequential-equivalent, {speedup:.1f}x)")
+        slowest = sorted(timings, reverse=True)[:5]
+        if slowest and slowest[0][0] >= 0.005:
+            lines.append("  Slowest checks:")
+            for dt, s, n in slowest:
+                lines.append(f"    - {s} :: {n} -- {dt * 1000:.0f} ms")
     lines.append("  RESULT: " + ("ALL GREEN" if ok else "FAILURES PRESENT"))
     return "\n".join(lines)
 
@@ -1217,13 +1476,16 @@ def main(argv=None) -> int:
         prog="diagtool-selftest",
         description="Offline self-test for DiagTool (no robots required).")
     p.add_argument("--no-sim", action="store_true",
-                   help="skip the simulated end-to-end sweep (~8s)")
+                   help="skip the simulated end-to-end sweep (real wall-clock, "
+                        "the slowest checks even run in parallel)")
+    p.add_argument("--workers", type=int, default=None,
+                   help="thread-pool width (default: auto, ~4x cpu count)")
     p.add_argument("--no-net", action="store_true",
                    help="skip the socket/engine wiring checks")
     args = p.parse_args(argv)
 
     rep = run_selftest(log=print, include_sim=not args.no_sim,
-                       include_net=not args.no_net)
+                       include_net=not args.no_net, max_workers=args.workers)
     return 0 if rep["ok"] else 1
 
 
