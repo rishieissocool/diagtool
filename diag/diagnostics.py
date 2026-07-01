@@ -55,6 +55,13 @@ DEFAULTS = {
                                 # several x faster than commanded, so keep the
                                 # real speed (and coast) small near walls
     "test_w_rads": 0.20,        # commanded angular speed for rotation test
+    "spin_trials": 4,           # pure-spin (in-place rotation) calibration trials
+    "spin_w_rads": 0.5,         # commanded angular speed for the spin calibration
+                                # (clamped to MAX_W); higher = cleaner w_scale, but
+                                # a robot with a low SAFE-mode W limit may freeze
+    "spin_seconds": 1.2,        # steady-spin measurement window per trial (s)
+    "spin_drift_warn_mm": 120.0,# flag a robot whose centre wanders more than this
+                                # while spinning in place (wheel/encoder cal off)
     "accel_settle_s": 0.5,      # ignore this much accel before steady measure
     "stop_buffer_mm": 350.0,    # stop a run this far before the arena edge
     "max_run_s": 4.0,           # hard cap on any single run (s)
@@ -68,6 +75,14 @@ DEFAULTS = {
                                    # keep-off margin (robots never leave it)
     "brake_zone_mm": 300.0,        # decel ramp distance before the arena edge
     "direct_blind_speed_ms": 0.25, # speed cap for direct/jog with no vision
+    # --- custom test zone (world mm); None -> use the full symmetric arena ---
+    # Set these to restrict testing to part of the field (e.g. one half at a comp).
+    # Usually set by dragging a box on the field view (persisted to test_zone.yaml),
+    # but can be pinned here. Clamped to the keep-off-walls safe box either way.
+    "test_zone_x_min_mm": None,    # zone min x (length axis, goal-to-goal)
+    "test_zone_x_max_mm": None,    # zone max x
+    "test_zone_y_min_mm": None,    # zone min y (width axis, touchline-to-touchline)
+    "test_zone_y_max_mm": None,    # zone max y
     # --- predictive emergency stop (uses MEASURED vision velocity) ---
     # Catches a robot that moves faster than commanded or coasts/drifts: it is
     # cut the moment its real stopping distance would breach the arena. Tuned
@@ -257,19 +272,21 @@ class Diagnostic:
         return "  [" + " ".join(parts) + "]"
 
     def _dir_to_open(self, pose):
-        """World unit vector pointing into open field (toward centre)."""
+        """World unit vector pointing into open space (toward the test-zone centre)."""
         x, y, _ = pose
-        d = math.hypot(x, y)
+        cx, cy = self.lim.arena_cx, self.lim.arena_cy
+        dx, dy = cx - x, cy - y
+        d = math.hypot(dx, dy)
         if d < 250:
-            return (1.0, 0.0)   # already central; pick +x (most room)
-        return (-x / d, -y / d)
+            return self._open_x_dir(pose)[:2]   # already central; head along x
+        return (dx / d, dy / d)
 
     def _open_x_dir(self, pose):
-        """Drive direction along the long (x) axis toward open field, and the
-        room that way (mm). Always points away from the nearer end wall — it
-        never reverses toward a wall the way a naive 'flip' can."""
+        """Drive direction along the long (x) axis toward open space, and the room
+        that way (mm). Always points toward the zone centre, so it never reverses
+        toward a wall (or out of an off-centre test zone) the way a naive flip can."""
         x = pose[0]
-        ux = -1.0 if x > 0 else 1.0
+        ux = 1.0 if x <= self.lim.arena_cx else -1.0   # tie at centre -> +x
         return ux, 0.0, self._room_ahead(pose, ux, 0.0)
 
     def _emergency_seen(self, robot) -> bool:
@@ -277,17 +294,16 @@ class Diagnostic:
 
     def _room_ahead(self, pose, ux, uy) -> float:
         x, y, _ = pose
-        xs = self.lim.arena_half_len
-        ys = self.lim.arena_half_wid
+        xlo, xhi, ylo, yhi = self.lim.arena_bounds()
         ts = []
         if ux > 1e-6:
-            ts.append((xs - x) / ux)
+            ts.append((xhi - x) / ux)
         elif ux < -1e-6:
-            ts.append((-xs - x) / ux)
+            ts.append((xlo - x) / ux)
         if uy > 1e-6:
-            ts.append((ys - y) / uy)
+            ts.append((yhi - y) / uy)
         elif uy < -1e-6:
-            ts.append((-ys - y) / uy)
+            ts.append((ylo - y) / uy)
         ts = [t for t in ts if t > 0]
         return min(ts) if ts else 0.0
 
@@ -737,6 +753,130 @@ class AngularDiagnostic(Diagnostic):
         }
 
 
+# ── Spin-in-place calibration (pure rotation, no translation) ──────────────
+
+class SpinCalibrationDiagnostic(Diagnostic):
+    """Pure spin in place: command rotation only (vx=vy=0) and measure how well
+    the robot turns without translating.
+
+    Reports, per robot:
+      * w_scale          actual / commanded angular speed (cleaner than the
+                         angular test's, measured over a longer steady window),
+      * spin_latency_ms  time from the spin command to first rotation,
+      * center_drift_mm  how far the robot's CENTRE wandered while spinning — a
+                         well-calibrated omni robot spins about its centre, so
+                         this should be ~0; a large value means the wheel radii
+                         / encoder scales are mismatched (the robot "walks" while
+                         turning). This is the headline precision number.
+
+    Safety: the command is streamed through the same wall-safe Commander as every
+    other test. Rotation itself can't drive a robot into a wall; if a miscalibrated
+    robot *translates* while spinning, the Commander's predictive emergency stop
+    (on MEASURED vision velocity) cuts it the instant its real stopping distance
+    would breach the arena/test-zone — so the trial is aborted, not the robot.
+    """
+
+    name = "spin"
+    title = "Spin-in-place calibration (pure rotation)"
+
+    def run(self, robot, log, progress, stop) -> dict:
+        if not self._wait_visible(robot, log):
+            return {"error": "robot not visible"}
+        trials = int(self.s("spin_trials"))
+        w_cmd = min(float(self.s("spin_w_rads")), self.lim.max_w)
+        spin_s = float(self.s("spin_seconds"))
+        onset = float(self.s("onset_angle_rad"))
+        warn_mm = float(self.s("spin_drift_warn_mm"))
+        scales, lat_ms, drifts, abs_w, no_motion, guard_trips = [], [], [], [], 0, 0
+        sign = 1
+        try:
+            for i in range(trials):
+                self._check(stop)
+                progress(i / trials, f"spin {i + 1}/{trials}")
+                self._settle(robot, log, stop)
+                s0 = self._pose(robot)
+                if s0 is None:
+                    no_motion += 1
+                    continue
+                x0, y0, o0 = s0.x, s0.y, s0.o
+                w_target = sign * w_cmd
+
+                self._reset_cmd_stats(robot)
+                t_cmd = time.perf_counter()
+                # pure spin: world-frame rotation only, full safety pipeline on
+                self.cmd.set_velocity(robot.is_yellow, robot.robot_id,
+                                      vx=0.0, vy=0.0, w=w_target,
+                                      frame="world", safe=True)
+
+                def turned(s, _):
+                    return abs(_ang_diff(s.o, o0)) >= onset
+
+                s_on, ok = self._poll_until(robot, turned, timeout=1.6, stop=stop)
+                if not ok:
+                    no_motion += 1
+                    self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+                    log(f"  spin {i + 1}: NO ROTATION within timeout"
+                        + self._explain_no_motion(robot))
+                    sign = -sign
+                    continue
+                lat = (s_on.t_perf - t_cmd) * 1000.0
+                lat_ms.append(lat)
+
+                # steady spin window: track angular rate and centre drift
+                tr = MotionTracker(0.6)
+                max_drift = 0.0
+                last_fn = None
+                tripped = False
+                end = time.perf_counter() + spin_s
+                while time.perf_counter() < end:
+                    self._check(stop)
+                    s = self._pose(robot)
+                    if s is not None and s.frame_number != last_fn:
+                        last_fn = s.frame_number
+                        tr.add(s.t_perf, s.x, s.y, s.o)
+                        max_drift = max(max_drift, math.hypot(s.x - x0, s.y - y0))
+                    if self._emergency_seen(robot):
+                        tripped = True
+                        break
+                    time.sleep(self.s("poll_s"))
+                self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+
+                actual_w = tr.omega() if tr.ready else 0.0
+                scale = abs(actual_w) / w_cmd if w_cmd > 0 else 0.0
+                scales.append(scale)
+                abs_w.append(abs(actual_w))
+                drifts.append(max_drift)
+                if tripped:
+                    guard_trips += 1
+                    log(f"  spin {i + 1}: boundary guard tripped — robot "
+                        f"TRANSLATED while spinning (drift {max_drift:.0f} mm); "
+                        "wheel/encoder calibration is off")
+                else:
+                    flag = "  [!] drifts" if max_drift > warn_mm else ""
+                    log(f"  spin {i + 1}: w_scale={scale:.3f} "
+                        f"actual_w={actual_w:.3f} rad/s  centre_drift="
+                        f"{max_drift:.0f} mm  latency={lat:.0f} ms{flag}")
+                sign = -sign
+                self._settle(robot, log, stop, dur=0.4)
+        finally:
+            self._settle(robot, log, stop, dur=0.5)
+
+        return {
+            "commanded_w_rads": w_cmd,
+            "spin_seconds": spin_s,
+            "w_scale": summarize(scales, ""),
+            "actual_w_rads": summarize(abs_w, "rad/s"),
+            "spin_latency_ms": summarize(lat_ms, "ms"),
+            "center_drift_mm": summarize(drifts, "mm"),
+            "trials": trials,
+            "no_motion_trials": no_motion,
+            "boundary_guard_trips": guard_trips,
+            "note": ("center_drift_mm ~0 = spins cleanly about its centre; a large "
+                     "drift (or a boundary-guard trip) means the robot translates "
+                     "while turning — mismatched wheel radii / encoder scales."),
+        }
+
+
 # ── Registry ──────────────────────────────────────────────────────────────
 
 ALL_DIAGNOSTICS = [
@@ -748,4 +888,15 @@ ALL_DIAGNOSTICS = [
     AngularDiagnostic,
 ]
 
+# The spin calibration is available by name (engine.run_diagnostic("spin") and
+# the Auto-Calibrate tab) but deliberately NOT in ALL_DIAGNOSTICS, so the
+# existing Diagnostics-tab battery / Full Sweep / self-test are unchanged.
 BY_NAME = {d.name: d for d in ALL_DIAGNOSTICS}
+BY_NAME[SpinCalibrationDiagnostic.name] = SpinCalibrationDiagnostic
+
+# Canonical test order for a full per-robot calibration (used by the
+# Auto-Calibrate tab and engine.run_auto_calibration).
+CALIBRATION_TESTS = [
+    "vision_health", "telemetry_health", "command_latency",
+    "stop_latency", "speed_scale", "angular", "spin",
+]

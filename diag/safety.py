@@ -45,6 +45,14 @@ class Limits:
     field_margin: float     # mm   (TeamControl's keep-off-walls margin)
     boundary_inset: float = 0.0   # mm extra inset -> a tighter "arena"
     brake_zone: float = 400.0     # mm before the arena edge where braking starts
+    # Optional explicit test zone (world mm, x=length axis / y=width axis). When
+    # any of these is set the drive arena becomes this rectangle (clamped to the
+    # keep-off-walls safe box) instead of the symmetric field-minus-inset box --
+    # e.g. set them to one half of the field when that's all you have at a comp.
+    zone_x_min: float | None = None
+    zone_x_max: float | None = None
+    zone_y_min: float | None = None
+    zone_y_max: float | None = None
 
     @property
     def safe_margin(self) -> float:
@@ -52,26 +60,96 @@ class Limits:
         return self.field_margin + self.robot_radius
 
     @property
+    def safe_half_len(self) -> float:
+        """+/-x half-extent of the keep-off-walls safe box (the hard cap that
+        even a custom test zone can never exceed)."""
+        return max(0.0, self.half_len - self.safe_margin)
+
+    @property
+    def safe_half_wid(self) -> float:
+        """+/-y half-extent of the keep-off-walls safe box."""
+        return max(0.0, self.half_wid - self.safe_margin)
+
+    @property
     def arena_half_len(self) -> float:
-        """+/-x half-extent of the drive arena (robots are kept inside this)."""
+        """+/-x half-extent of the default (symmetric) drive arena."""
         return max(0.0, self.half_len - self.safe_margin - self.boundary_inset)
 
     @property
     def arena_half_wid(self) -> float:
-        """+/-y half-extent of the drive arena."""
+        """+/-y half-extent of the default (symmetric) drive arena."""
         return max(0.0, self.half_wid - self.safe_margin - self.boundary_inset)
+
+    @property
+    def has_custom_zone(self) -> bool:
+        """True if an explicit test zone (drag-set) is in effect."""
+        return any(v is not None for v in
+                   (self.zone_x_min, self.zone_x_max, self.zone_y_min, self.zone_y_max))
+
+    def arena_bounds(self) -> tuple[float, float, float, float]:
+        """Effective drive-zone rectangle (x_lo, x_hi, y_lo, y_hi) in world mm.
+
+        With no custom test zone this is the symmetric arena (field minus margin
+        minus inset). A custom zone is used as-is but clamped to the keep-off-walls
+        safe box, so the robot is always kept off the walls no matter what's drawn.
+        """
+        shl, shw = self.safe_half_len, self.safe_half_wid
+        if not self.has_custom_zone:
+            ax, ay = self.arena_half_len, self.arena_half_wid
+            return (-ax, ax, -ay, ay)
+        xmn = self.zone_x_min if self.zone_x_min is not None else -shl
+        xmx = self.zone_x_max if self.zone_x_max is not None else shl
+        ymn = self.zone_y_min if self.zone_y_min is not None else -shw
+        ymx = self.zone_y_max if self.zone_y_max is not None else shw
+        x_lo, x_hi = sorted((clamp(xmn, -shl, shl), clamp(xmx, -shl, shl)))
+        y_lo, y_hi = sorted((clamp(ymn, -shw, shw), clamp(ymx, -shw, shw)))
+        return (x_lo, x_hi, y_lo, y_hi)
+
+    @property
+    def arena_x_lo(self) -> float:
+        return self.arena_bounds()[0]
+
+    @property
+    def arena_x_hi(self) -> float:
+        return self.arena_bounds()[1]
+
+    @property
+    def arena_y_lo(self) -> float:
+        return self.arena_bounds()[2]
+
+    @property
+    def arena_y_hi(self) -> float:
+        return self.arena_bounds()[3]
+
+    @property
+    def arena_cx(self) -> float:
+        """x of the drive-zone centre (0 for the default symmetric arena)."""
+        b = self.arena_bounds()
+        return 0.5 * (b[0] + b[1])
+
+    @property
+    def arena_cy(self) -> float:
+        """y of the drive-zone centre."""
+        b = self.arena_bounds()
+        return 0.5 * (b[2] + b[3])
 
 
 def limits(boundary_inset: float = 0.0, brake_zone: float = 400.0,
-           half_len: float | None = None, half_wid: float | None = None) -> Limits:
+           half_len: float | None = None, half_wid: float | None = None,
+           zone_x_min: float | None = None, zone_x_max: float | None = None,
+           zone_y_min: float | None = None, zone_y_max: float | None = None) -> Limits:
     """Build the limit set. `half_len`/`half_wid` (mm) override the field size
     (e.g. from SSL-Vision geometry); when omitted, TeamControl's field_config
-    constants are used."""
+    constants are used. `zone_*` (mm) set an explicit test zone — see Limits."""
     c = _consts()
     if half_len is None or half_wid is None:
         gl, gw = bridge.get_field_geometry()
         half_len = gl if half_len is None else half_len
         half_wid = gw if half_wid is None else half_wid
+
+    def _opt(v):
+        return None if v is None else float(v)
+
     return Limits(
         max_speed=float(c.MAX_SPEED),
         max_w=float(c.MAX_W),
@@ -81,6 +159,8 @@ def limits(boundary_inset: float = 0.0, brake_zone: float = 400.0,
         field_margin=float(c.FIELD_MARGIN),
         boundary_inset=max(0.0, float(boundary_inset)),
         brake_zone=max(0.0, float(brake_zone)),
+        zone_x_min=_opt(zone_x_min), zone_x_max=_opt(zone_x_max),
+        zone_y_min=_opt(zone_y_min), zone_y_max=_opt(zone_y_max),
     )
 
 
@@ -108,10 +188,11 @@ def nearest_wall_dist(x: float, y: float, lim: Limits | None = None) -> float:
 
 def in_safe_zone(x: float, y: float, lim: Limits | None = None,
                  extra: float = 0.0) -> bool:
-    """True if (x, y) is inside the drive arena (field minus margin minus inset)."""
+    """True if (x, y) is inside the drive arena / test zone (with `extra` margin)."""
     lim = lim or limits()
-    return abs(x) <= (lim.arena_half_len - extra) and \
-        abs(y) <= (lim.arena_half_wid - extra)
+    xlo, xhi, ylo, yhi = lim.arena_bounds()
+    return (xlo + extra) <= x <= (xhi - extra) and \
+        (ylo + extra) <= y <= (yhi - extra)
 
 
 def wall_brake(x: float, y: float, vx: float, vy: float) -> tuple[float, float]:
@@ -120,20 +201,21 @@ def wall_brake(x: float, y: float, vx: float, vy: float) -> tuple[float, float]:
     return _NAV.wall_brake(x, y, vx, vy)
 
 
-def _brake_axis(p: float, v: float, bound: float, brake: float) -> float:
-    """Ramp the *outward* velocity on one axis to 0 as the robot nears +/-bound.
+def _brake_axis(p: float, v: float, lo: float, hi: float, brake: float) -> float:
+    """Ramp the *outward* velocity on one axis to 0 as the robot nears [lo, hi].
 
-    Inward motion is never touched (the robot can always head back to centre).
-    Beyond the boundary the outward component is fully removed (hard stop).
+    Inward motion is never touched (the robot can always head back into the zone).
+    Beyond either edge the outward component is fully removed (hard stop). `lo`/`hi`
+    need not be symmetric, so this works for an off-centre test zone.
     """
     if v > 0:
-        room = bound - p
+        room = hi - p
     elif v < 0:
-        room = bound + p
+        room = p - lo
     else:
         return v
     if room <= 0.0:
-        return 0.0                       # at/over the arena edge: no outward motion
+        return 0.0                       # at/over the zone edge: no outward motion
     if brake > 0.0 and room < brake:
         return v * (room / brake)        # linear decel into the boundary
     return v
@@ -141,16 +223,17 @@ def _brake_axis(p: float, v: float, bound: float, brake: float) -> float:
 
 def limit_to_arena(x: float, y: float, vx_w: float, vy_w: float,
                    lim: Limits | None = None) -> tuple[float, float]:
-    """Brake + hard-stop a WORLD-frame velocity at the (tighter) arena edge.
+    """Brake + hard-stop a WORLD-frame velocity at the drive-zone edge.
 
-    Replaces the old instant outward-guard: instead of only zeroing velocity at
-    the margin (after which the robot still coasts), this ramps speed down over
-    `brake_zone` mm so the robot is already crawling when it reaches the arena
-    line, and zeroes any outward component at/past it.
+    Instead of only zeroing velocity at the margin (after which the robot still
+    coasts), this ramps speed down over `brake_zone` mm so the robot is already
+    crawling when it reaches the zone line, and zeroes any outward component
+    at/past it. Honours a custom (drag-set) test zone via `arena_bounds()`.
     """
     lim = lim or limits()
-    vx_w = _brake_axis(x, vx_w, lim.arena_half_len, lim.brake_zone)
-    vy_w = _brake_axis(y, vy_w, lim.arena_half_wid, lim.brake_zone)
+    xlo, xhi, ylo, yhi = lim.arena_bounds()
+    vx_w = _brake_axis(x, vx_w, xlo, xhi, lim.brake_zone)
+    vy_w = _brake_axis(y, vy_w, ylo, yhi, lim.brake_zone)
     return vx_w, vy_w
 
 

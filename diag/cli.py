@@ -20,7 +20,7 @@ import threading
 import time
 
 from . import bridge
-from .diagnostics import ALL_DIAGNOSTICS, BY_NAME
+from .diagnostics import ALL_DIAGNOSTICS, BY_NAME, CALIBRATION_TESTS
 from .report import render_text
 
 
@@ -71,8 +71,7 @@ def _announce_field(engine, wait_s: float = 2.0):
     engine.refresh_field_geometry()
     fi = engine.field_info()
     _log(f"field: {fi['length_mm']:.0f} x {fi['width_mm']:.0f} mm "
-         f"(source: {fi['source']}); arena +/-{fi['arena_half_len_mm']:.0f} x "
-         f"+/-{fi['arena_half_wid_mm']:.0f} mm")
+         f"(source: {fi['source']}); {engine.zone_desc()}")
     if fi["source"] == "field_config":
         _log("[!] field size came from field_config constants (vision sent no "
              "geometry and no field_length_mm/field_width_mm set) — verify it "
@@ -177,6 +176,44 @@ def _cmd_sweep(engine, args):
     return _run_tests(engine, robots, tests, args)
 
 
+def _cmd_calibrate(engine, args):
+    """Auto-calibrate each robot individually: per-robot report folders plus a
+    combined report + calibration_summary.csv under output/autocal_<ts>/. Includes
+    the spin-in-place calibration by default. Optionally restrict to our half."""
+    robots = _resolve_robots(engine, args) or engine.robots(real_only=True)
+    if not robots:
+        _log("No robots selected. Use --robot Y0, --robots Y0,Y1, or --real.")
+        return 2
+    tests = ([s.strip() for s in args.tests.split(",")] if args.tests
+             else list(CALIBRATION_TESTS))
+    _announce_field(engine)
+    half = getattr(args, "half", None)
+    if half in ("pos", "neg"):
+        engine.set_field_half(positive=(half == "pos"))
+        _log(f"restricted to our half: {engine.zone_desc()}")
+    else:
+        _log("[!] no --half given — driving the FULL field. Pass --half pos|neg "
+             "to keep robots on one side (the usual comp case).")
+    _warn_conflicts(engine, robots)
+    ev, stop = _make_stop()
+
+    def progress(frac, text=""):
+        sys.stdout.write(f"\r  [{frac * 100:5.1f}%] {text:50.50}")
+        sys.stdout.flush()
+
+    try:
+        rep = engine.run_auto_calibration(robots, tests, log=_log,
+                                          progress=progress, stop=stop,
+                                          output_dir=args.output)
+    except KeyboardInterrupt:
+        ev.set()
+        _log("\nInterrupted.")
+        return 130
+    _log("\n")
+    _log(render_text(rep))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="diagtool", description="Robot diagnostics & calibration (headless).")
@@ -208,9 +245,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_robot_args(swp)
     swp.add_argument("--tests", help="comma list of test names (default: all)")
 
-    cp = sub.add_parser("calibrate", help="alias for sweep")
+    cp = sub.add_parser(
+        "calibrate",
+        help="auto-calibrate robots individually (per-robot + combined report)")
     _add_robot_args(cp)
-    cp.add_argument("--tests", help="comma list of test names (default: all)")
+    cp.add_argument("--tests",
+                    help="comma list of test names (default: full calibration "
+                         "incl. spin)")
+    cp.add_argument("--half", choices=["pos", "neg"],
+                    help="restrict driving to OUR half of the field "
+                         "(pos = +x side, neg = -x side) — recommended at a comp")
 
     st = sub.add_parser("selftest",
                         help="offline self-test (no robots/network needed)")
@@ -270,7 +314,7 @@ def main(argv=None) -> int:
         "health": _cmd_health,
         "test": _cmd_test,
         "sweep": _cmd_sweep,
-        "calibrate": _cmd_sweep,
+        "calibrate": _cmd_calibrate,
     }
     fn = dispatch.get(args.command)
     try:

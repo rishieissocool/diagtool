@@ -263,6 +263,10 @@ def render_text(report: dict) -> str:
         add(f"     stop overshoot    : {rs.get('stop_overshoot_mm')} mm")
         add(f"     command latency   : {rs.get('command_latency_ms')} ms")
         add(f"     rotation latency  : {rs.get('rotation_latency_ms')} ms")
+        if rs.get("spin_w_scale") is not None or rs.get("spin_center_drift_mm") is not None:
+            add(f"     spin w_scale      : {rs.get('spin_w_scale')}")
+            add(f"     spin centre drift : {rs.get('spin_center_drift_mm')} mm "
+                "(0 = spins in place; large = wheels/encoders off)")
         for w in rs.get("warnings", []):
             add(f"     [!] {w}")
     add("")

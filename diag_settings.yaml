@@ -34,6 +34,20 @@ stop_trials: 5
 angular_trials: 4
 speed_passes: 4
 
+# --- spin-in-place calibration (Auto-Calibrate tab; pure rotation, no move) ---
+# Measures w_scale, spin latency, and centre-drift: how far the robot's centre
+# wanders while spinning. A well-calibrated robot spins about its centre, so
+# centre-drift should be ~0; a large value means the wheel radii / encoder
+# scales are mismatched (the robot "walks" while turning). The spin command is
+# wall-safe like every other test: if a miscalibrated robot translates toward a
+# wall while spinning, the predictive emergency-stop cuts it.
+spin_trials: 4           # number of in-place spin trials (alternating direction)
+spin_w_rads: 0.5         # commanded angular speed for the spin (clamped to MAX_W).
+                         # Higher = cleaner w_scale; lower = safer if a robot has
+                         # a low SAFE-mode W limit (it may freeze instead of spin).
+spin_seconds: 1.2        # steady-spin measurement window per trial (s)
+spin_drift_warn_mm: 120.0  # warn if the centre wanders more than this while spinning
+
 # --- timing / safety windows ---
 settle_s: 1.0            # stop-and-wait before/after each motion
 accel_settle_s: 0.5      # ignore this much accel before measuring steady speed
@@ -58,6 +72,17 @@ field_width_mm: 2230     # y, touchline to touchline
 boundary_inset_mm: 250.0     # shrink the arena this far inside the keep-off margin
 brake_zone_mm: 300.0         # start decelerating this far before the arena edge
 direct_blind_speed_ms: 0.25  # speed cap for direct/jog moves with NO vision
+
+# --- custom test zone (mm, world coords; x = goal-goal, y = touchlines) ---
+# Restrict driving/tests to PART of the field (e.g. one half at a comp). Normally
+# you just drag a box on the GUI field view, which saves the zone to test_zone.yaml
+# (a separate file, so this one is never rewritten). You can also pin it here. The
+# zone is always clamped to the keep-off-walls margin. Leave all four unset to use
+# the whole field.
+# test_zone_x_min_mm:
+# test_zone_x_max_mm:
+# test_zone_y_min_mm:
+# test_zone_y_max_mm:
 
 # --- predictive emergency stop (the real wall-protection) ---
 # Watches the robot's ACTUAL velocity from vision and cuts the command the

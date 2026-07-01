@@ -89,6 +89,18 @@ TeamControl's keep-off margin (`FIELD_MARGIN + ROBOT_RADIUS`) minus an extra
 Make it tighter or looser in `diag_settings.yaml` (`boundary_inset_mm`,
 `brake_zone_mm`, `max_travel_mm`, `direct_blind_speed_ms`).
 
+### Restrict testing to part of the field (drag a test zone)
+
+At a competition you often only get **half a field** (or one corner). In the GUI
+**Diagnostics** tab, **drag a box on the field view** to set a custom *test zone*:
+driving, jog and the whole test battery are then kept inside that rectangle — not
+just a smaller centred box, but wherever you draw it. The zone is the cyan box
+(with its size in mm); a **Full field** button clears it. It's always clamped to
+the keep-off-walls safe margin, so you can't accidentally drag a robot into a
+wall, and it's **saved** (to `test_zone.yaml`) so it survives a restart. You can
+also pin it from config via the `test_zone_*_mm` keys. Zone editing is locked
+while a test is running.
+
 ---
 
 ## Requirements
@@ -140,6 +152,26 @@ The dashboard has three tabs:
   robot is driven through its own target (grSim packet or RobotCommand), so the
   same pad works in the simulator and on the field. Any robot vision can see is
   still arena-braked and emergency-stopped.
+* **Auto-Calibrate** — **hands-off calibration of a whole team**, one robot at a
+  time. Pick **our team colour** (Yellow/Blue) and **our side** of the field, tick
+  **"restrict to our half"** (the common case — you only get one side) and the
+  drive zone shrinks to that half (clamped to the keep-off-walls box). Fix any IPs
+  inline (applies live), tick the robots, press **Start**: each robot is probed,
+  then the full battery — including a dedicated **spin-in-place calibration** —
+  runs on it while results stream into a table. **Every robot is different**, so
+  each is measured and reported individually. A **per-robot report folder** plus a
+  **combined report + `calibration_summary.csv`** are written under
+  `output/autocal_<timestamp>/`. Unreachable robots are **skipped, not retried**,
+  so one dead robot never stalls the batch. It drives **only** through the same
+  wall-safe Commander every other test uses — one robot moves at a time, kept
+  inside the zone, predictive-emergency-stopped — so it **cannot hit anything**.
+
+  > **Spin calibration.** The spin test commands pure rotation (no translation)
+  > and reports `w_scale`, spin latency, and the headline precision number
+  > **centre-drift** — how far the robot's centre wanders while spinning. ~0 means
+  > it spins cleanly in place; a large drift (or a boundary-guard trip) means the
+  > wheel radii / encoder scales are mismatched and the robot walks while turning.
+
 * **Setup** — edit each robot's **IP / port / target (real vs grSim) live**.
   Change a value and **Apply**: the running command stream switches to the new
   address immediately, no restart. **Reload from file** re-reads `ipconfig.yaml`;
@@ -182,7 +214,16 @@ python run_diag.py --cli health --robot Y0
 python run_diag.py --cli test command_latency --robot Y0
 python run_diag.py --cli sweep --real               # full battery, all real robots
 python run_diag.py --cli sweep --robots Y0,Y1 --tests command_latency,speed_scale
+python run_diag.py --cli calibrate --real --half pos  # auto-calibrate every real
+                                                    # robot on our +x half; writes
+                                                    # per-robot + combined reports
 ```
+
+**`calibrate`** is the headless twin of the **Auto-Calibrate** tab: it calibrates
+each selected robot individually (full battery incl. the spin-in-place test) and
+writes a per-robot report folder plus a combined report + `calibration_summary.csv`
+under `output/autocal_<timestamp>/`. Pass `--half pos|neg` to keep robots on one
+side of the field (recommended at a comp — robots are kept inside that half).
 
 **`probe`** is the first thing to run when a robot won't move. It streams a
 harmless zero heartbeat straight to the robot's `ip:port` (add `--move 0.2` for a

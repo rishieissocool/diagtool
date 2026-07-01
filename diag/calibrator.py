@@ -33,6 +33,7 @@ def summarize_robot(label: str, results: dict) -> dict:
     ang = results.get("angular", {})
     stop = results.get("stop_latency", {})
     lat = results.get("command_latency", {})
+    spin = results.get("spin", {})
 
     out = {
         "robot": label,
@@ -45,6 +46,10 @@ def summarize_robot(label: str, results: dict) -> dict:
         "stop_overshoot_mm": _round(_mean(stop.get("coast_distance_mm")), 1),
         "stop_latency_ms": _round(_mean(stop.get("stop_latency_ms")), 1),
         "command_latency_ms": _round(_mean(lat.get("latency_ms")), 1),
+        # spin-in-place calibration (present only when the spin test was run)
+        "spin_w_scale": _round(_mean(spin.get("w_scale")), 4),
+        "spin_center_drift_mm": _round(_mean(spin.get("center_drift_mm")), 1),
+        "spin_latency_ms": _round(_mean(spin.get("spin_latency_ms")), 1),
     }
 
     warnings = []
@@ -60,6 +65,19 @@ def summarize_robot(label: str, results: dict) -> dict:
         warnings.append(
             f"speed_scale={out['speed_scale']} is far from 1.0 — strong sign of a "
             "units/gearing mismatch in wheel velocity (see report suspects).")
+    if spin.get("no_motion_trials") and spin.get("no_motion_trials") >= spin.get("trials", 99):
+        warnings.append(
+            "spin test saw NO rotation in every trial — SAFE-mode W limit freeze "
+            "or comms (see report suspects).")
+    if out["spin_center_drift_mm"] is not None and out["spin_center_drift_mm"] > 120.0:
+        warnings.append(
+            f"spin centre drift {out['spin_center_drift_mm']} mm — the robot "
+            "translates while spinning (mismatched wheel radii / encoder scales); "
+            "it will not hold position while rotating.")
+    if spin.get("boundary_guard_trips"):
+        warnings.append(
+            f"{spin['boundary_guard_trips']} spin trial(s) tripped the boundary "
+            "guard (robot walked toward the edge while spinning) — calibrate wheels.")
     out["warnings"] = warnings
     return out
 

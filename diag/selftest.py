@@ -87,6 +87,14 @@ _SYNTH_LIM = safety.Limits(
     robot_radius=90.0, field_margin=300.0,
 )
 
+# A custom (drag-set) test zone: roughly the +x half of the field. zone_x_max is
+# deliberately past the safe box (1610) to prove it gets clamped. safe box here
+# is +/-1610 (x) by +/-1110 (y); the zone resolves to x[0,1610] y[-600,600].
+_ZONE_LIM = safety.Limits(
+    max_speed=1.0, max_w=1.8, half_len=2000.0, half_wid=1500.0,
+    robot_radius=90.0, field_margin=300.0,
+    zone_x_min=0.0, zone_x_max=9999.0, zone_y_min=-600.0, zone_y_max=600.0)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # 1. metrics
@@ -374,6 +382,25 @@ def open_direction_and_room():
     assert approx(room, _SYNTH_LIM.half_len - _SYNTH_LIM.safe_margin)
 
 
+@_test("diagnostics-math")
+def open_direction_and_room_follow_custom_zone():
+    # with an off-centre test zone, "open" is the ZONE centre (800, 0), and room
+    # is measured to the ZONE edges, not the field/symmetric-arena edges.
+    ctx = DiagContext(None, None, None, {}, _ZONE_LIM)
+    diag = BY_NAME["command_latency"](ctx)
+    assert approx(_ZONE_LIM.arena_cx, 805.0) and approx(_ZONE_LIM.arena_cy, 0.0)
+    # near the zone's low-x edge -> head +x, into the zone
+    ux, uy = diag._dir_to_open((50.0, 0.0, 0.0))
+    assert ux > 0
+    ux, _, room = diag._open_x_dir((50.0, 0.0, 0.0))
+    assert approx(ux, 1.0) and approx(room, 1610.0 - 50.0)
+    # near the zone's high-x edge -> head back -x toward centre
+    ux2, _, _ = diag._open_x_dir((1500.0, 0.0, 0.0))
+    assert approx(ux2, -1.0)
+    # room from zone centre to its +x edge
+    assert approx(diag._room_ahead((805.0, 0.0, 0.0), 1.0, 0.0), 1610.0 - 805.0)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 5. safety — pure (synthetic limits, no TeamControl) ...
 # ══════════════════════════════════════════════════════════════════════════
@@ -463,6 +490,45 @@ def arena_pipeline_blocks_outside_inset():
     assert approx(math.hypot(vx_r, vy_r), 0.0, 1e-9)
 
 
+@_test("safety")
+def custom_zone_clamps_to_safe_box():
+    lim = _ZONE_LIM
+    assert lim.has_custom_zone
+    xlo, xhi, ylo, yhi = lim.arena_bounds()
+    assert approx(xlo, 0.0)
+    assert approx(xhi, 1610.0)          # zone_x_max 9999 clamped to the safe box
+    assert approx(ylo, -600.0) and approx(yhi, 600.0)
+    assert approx(lim.arena_cx, 805.0) and approx(lim.arena_cy, 0.0)   # (0+1610)/2
+
+
+@_test("safety")
+def custom_zone_in_safe_zone_is_rectangular():
+    lim = _ZONE_LIM
+    assert safety.in_safe_zone(800.0, 0.0, lim) is True
+    assert safety.in_safe_zone(-50.0, 0.0, lim) is False     # left of the zone
+    assert safety.in_safe_zone(50.0, 0.0, lim) is True
+    assert safety.in_safe_zone(800.0, 700.0, lim) is False    # above the zone
+    # the SAME point is fine under the default symmetric arena
+    assert safety.in_safe_zone(-50.0, 0.0, _SYNTH_LIM) is True
+
+
+@_test("safety")
+def custom_zone_brakes_and_hard_stops_at_its_edges():
+    lim = _ZONE_LIM                                  # x[0,1610], brake_zone 400
+    # well inside, headed +x -> full speed
+    vx, _ = safety.limit_to_arena(800.0, 0.0, 0.30, 0.0, lim)
+    assert approx(vx, 0.30)
+    # 100 mm inside the +x edge -> braked to a quarter
+    vx, _ = safety.limit_to_arena(1510.0, 0.0, 0.30, 0.0, lim)
+    assert approx(vx, 0.30 * (100.0 / 400.0), 1e-6)
+    # just left of (outside) the low-x edge, pushing further out -> hard zero
+    vx, _ = safety.limit_to_arena(-10.0, 0.0, -0.30, 0.0, lim)
+    assert vx == 0.0
+    # but heading back into the zone is never restricted
+    vx, _ = safety.limit_to_arena(-10.0, 0.0, 0.30, 0.0, lim)
+    assert approx(vx, 0.30)
+
+
 # ── safety against the REAL TeamControl constants (needs vendored tree) ────
 
 @_test("safety")
@@ -472,6 +538,19 @@ def real_limits_are_sane():
     assert lim.max_speed > 0 and lim.max_w > 0
     assert lim.half_len > 0 and lim.half_wid > 0
     assert lim.safe_margin == lim.field_margin + lim.robot_radius
+    assert lim.has_custom_zone is False                 # no zone by default
+
+
+@_test("safety")
+def limits_factory_carries_and_clamps_zone():
+    _need_movement()
+    lim = safety.limits(half_len=2000.0, half_wid=1500.0,
+                        zone_x_min=0.0, zone_x_max=9999.0,
+                        zone_y_min=-300.0, zone_y_max=300.0)
+    assert lim.has_custom_zone
+    xlo, xhi, ylo, yhi = lim.arena_bounds()
+    assert approx(xlo, 0.0) and approx(xhi, lim.safe_half_len)   # clamped to box
+    assert approx(ylo, -300.0) and approx(yhi, 300.0)
 
 
 @_test("safety")
@@ -832,6 +911,7 @@ _SIM_SETTINGS.update({
     "onset_disp_mm": 8.0, "onset_angle_rad": 0.04,
     "moving_mm_s": 80.0, "stopped_mm_s": 40.0,
     "test_speed_ms": 0.30, "test_w_rads": 0.25,
+    "spin_trials": 2, "spin_w_rads": 0.5, "spin_seconds": 0.3,
 })
 
 
@@ -1033,6 +1113,18 @@ def sim_angular_detects_rotation():
     assert "error" not in res, res.get("error")
     assert res["no_motion_trials"] < res["trials"], "no rotation detected"
     assert res["w_scale"]["n"] >= 1
+
+
+@_test("simulated sweep", tier="sim")
+def sim_spin_calibration():
+    res = _run_sim("spin")
+    assert "error" not in res, res.get("error")
+    assert res["no_motion_trials"] < res["trials"], "no spin detected"
+    assert res["w_scale"]["n"] >= 1
+    # a pure-spin command makes the sim robot rotate without translating, so the
+    # measured centre drift must be ~0 (this is the calibration's headline metric)
+    cd = res["center_drift_mm"]["mean"]
+    assert cd is not None and cd < 50.0, f"unexpected spin centre drift {cd} mm"
 
 
 # ══════════════════════════════════════════════════════════════════════════

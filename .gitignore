@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 output/
 
+# GUI-set test zone (drag a box on the field). Runtime/per-venue state, not code.
+test_zone.yaml
+
 # Optional local checkout for developing against a live TeamControl tree.
 # DiagTool ships the modules it needs under vendor/TeamControl, so this is
 # never part of the repo. Point at it with TEAMCONTROL_SRC if you have one.

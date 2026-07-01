@@ -26,8 +26,10 @@ from ..report import render_text
 from .field_view import FieldView
 from .overview_tab import OverviewTab
 from .robots_tab import RobotsTab
+from .vision_map_tab import VisionMapTab
 from .drive_tab import DriveTab
 from .setup_tab import SetupTab
+from .calibrate_tab import CalibrateTab
 from .theme import DARK_QSS
 
 
@@ -40,6 +42,7 @@ class Worker(QObject):
     sig_log = Signal(str)
     sig_progress = Signal(float, str)
     sig_done = Signal(dict)
+    sig_robot = Signal(dict)        # per-robot calibration updates (auto-calibrate)
 
     def __init__(self, engine: Engine, job: dict):
         super().__init__()
@@ -81,6 +84,21 @@ class Worker(QObject):
                     [robot], tests, log=log, progress=prog,
                     stop=self._stop.is_set)
                 self.sig_done.emit({"kind": "sweep", "report": rep, "probe": probe})
+            elif self.job["kind"] == "calibrate":
+                # Trial-count preset overlaid on the engine settings for this run
+                # only (restored in finally so other tabs are unaffected).
+                preset = self.job.get("preset") or {}
+                saved = {k: self.engine.settings.get(k) for k in preset}
+                try:
+                    self.engine.settings.update(preset)
+                    rep = self.engine.run_auto_calibration(
+                        self.job["robots"], self.job["tests"],
+                        log=log, progress=prog, stop=self._stop.is_set,
+                        per_robot_cb=lambda label, payload:
+                            self.sig_robot.emit({"label": label, **payload}))
+                finally:
+                    self.engine.settings.update(saved)
+                self.sig_done.emit({"kind": "calibrate", "report": rep})
             else:
                 rep = self.engine.run_sweep(
                     self.job["robots"], self.job["tests"],
@@ -100,6 +118,7 @@ class MainWindow(QMainWindow):
 
         self._thread: QThread | None = None
         self._worker: Worker | None = None
+        self._active_kind: str | None = None
         self._robots = engine.robots()
         self._row_by_label = {}
         self._jog_target = None
@@ -110,8 +129,7 @@ class MainWindow(QMainWindow):
         fi = self.engine.field_info()
         self._append_log(
             f"[field] {fi['length_mm']:.0f} x {fi['width_mm']:.0f} mm "
-            f"(source: {fi['source']}); arena ±{fi['arena_half_len_mm']:.0f} x "
-            f"±{fi['arena_half_wid_mm']:.0f} mm")
+            f"(source: {fi['source']}); {self.engine.zone_desc()}")
 
         for ip, labels in self.engine.ip_conflicts().items():
             self._append_log(f"[!] CONFIG: {ip} is shared by {', '.join(labels)} "
@@ -148,9 +166,19 @@ class MainWindow(QMainWindow):
         self.robots_tab.robot_selected.connect(self._select_robot_label)
         self.tabs.addTab(self.robots_tab, "Robots")
 
+        # Vision Map — standalone live top-down view of everything SSL-Vision
+        # is putting on the LAN (all robots both teams + ball).
+        self.vision_map_tab = VisionMapTab(self.engine)
+        self.tabs.addTab(self.vision_map_tab, "Vision Map")
+
         # Drive — move many robots at once (real + grSim).
         self.drive_tab = DriveTab(self.engine)
         self.tabs.addTab(self.drive_tab, "Drive")
+
+        # Auto-Calibrate — hands-off per-robot calibration on our half of field.
+        self.calibrate_tab = CalibrateTab(
+            self.engine, start_cb=self._start_worker, stop_cb=self._stop_job)
+        self.tabs.addTab(self.calibrate_tab, "Auto-Calibrate")
 
         # Setup — edit robot IP / port / target live.
         self.setup_tab = SetupTab(self.engine, on_changed=self._on_config_changed)
@@ -206,7 +234,31 @@ class MainWindow(QMainWindow):
             self.tbl.setItem(row, 4, QTableWidgetItem("—"))
         ll.addWidget(self.tbl, 1)
         self.field = FieldView(self.engine.lim)
+        self.field.zone_changed.connect(self._on_zone_changed)
         ll.addWidget(self.field, 1)
+
+        # test-zone controls: drag a box on the field above to restrict testing
+        # to part of the field (e.g. half a field at a comp); reset = full field.
+        zrow = QHBoxLayout()
+        zhint = QLabel("Drag a box on the field → test zone")
+        zhint.setToolTip(
+            "Drag a rectangle on the field to restrict driving/tests to that "
+            "area (handy when you only get half a field). Robots are actively "
+            "kept inside it. It's clamped to the keep-off-walls margin and saved "
+            "for next time.")
+        zhint.setStyleSheet("color:#9fb6a0; font-size:11px;")
+        self.lbl_zone = QLabel("")
+        self.lbl_zone.setStyleSheet("color:#cfe8cf; font-size:11px;")
+        self.btn_zone_reset = QPushButton("Full field")
+        self.btn_zone_reset.setToolTip("Clear the custom test zone and use the "
+                                       "whole field again.")
+        self.btn_zone_reset.clicked.connect(self._reset_zone)
+        zrow.addWidget(zhint)
+        zrow.addStretch()
+        zrow.addWidget(self.lbl_zone)
+        zrow.addWidget(self.btn_zone_reset)
+        ll.addLayout(zrow)
+        self._update_zone_label()
         split.addWidget(left)
 
         # right: controls + results + log
@@ -312,6 +364,31 @@ class MainWindow(QMainWindow):
         r = self._selected_robot()
         self.field.set_selected(r.label if r else None)
 
+    # -- test zone (drag-set drive area) --
+    def _update_zone_label(self):
+        lim = self.engine.lim
+        if getattr(lim, "has_custom_zone", False):
+            xlo, xhi, ylo, yhi = lim.arena_bounds()
+            self.lbl_zone.setText(
+                f"zone: {xhi - xlo:.0f} × {yhi - ylo:.0f} mm (custom)")
+            self.btn_zone_reset.setEnabled(True)
+        else:
+            self.lbl_zone.setText("zone: full field")
+            self.btn_zone_reset.setEnabled(False)
+
+    def _on_zone_changed(self, x_min, x_max, y_min, y_max):
+        """User dragged out a test zone on the field — apply + persist it."""
+        self.engine.set_test_zone(x_min, x_max, y_min, y_max)
+        self.field.set_limits(self.engine.lim)
+        self._update_zone_label()
+        self._append_log(f"[zone] set {self.engine.zone_desc()}")
+
+    def _reset_zone(self):
+        self.engine.clear_test_zone()
+        self.field.set_limits(self.engine.lim)
+        self._update_zone_label()
+        self._append_log("[zone] cleared — driving the full field again")
+
     def _select_robot_label(self, label: str):
         """Select a robot from a Competition/Robots card and jump to its tests."""
         row = self._row_by_label.get(label)
@@ -375,14 +452,30 @@ class MainWindow(QMainWindow):
         self.btn_sweep.setEnabled(not busy)
         self.btn_selftest.setEnabled(not busy)
         self.btn_stop.setEnabled(busy)
+        # don't let the zone change out from under a running test
+        self.field.set_zone_edit_enabled(not busy)
+        self.btn_zone_reset.setEnabled(not busy and
+                                       getattr(self.engine.lim, "has_custom_zone", False))
+        # lock the other motion-capable tabs so nothing else can drive a robot
+        # while a job (incl. an auto-calibration) is running.
+        self.drive_tab.setEnabled(not busy)
+        self.setup_tab.setEnabled(not busy)
+        # the calibrate tab manages its own controls (keeps its STOP live)
+        if self._active_kind != "calibrate":
+            self.calibrate_tab.setEnabled(not busy)
+        else:
+            self.calibrate_tab.set_busy(busy)
 
     def _append_log(self, msg: str):
         self.log.appendPlainText(msg)
+        if self._active_kind == "calibrate":
+            self.calibrate_tab.append_log(msg)
 
     # -- jobs --
     def _start_worker(self, job: dict):
         if self._thread is not None:
             return
+        self._active_kind = job.get("kind")
         self._busy(True)
         self.progress.setValue(0)
         self._thread = QThread(self)
@@ -391,6 +484,7 @@ class MainWindow(QMainWindow):
         self._thread.started.connect(self._worker.run)
         self._worker.sig_log.connect(self._append_log)
         self._worker.sig_progress.connect(self._on_progress)
+        self._worker.sig_robot.connect(self._on_robot_update)
         self._worker.sig_done.connect(self._on_done)
         self._thread.start()
 
@@ -398,6 +492,12 @@ class MainWindow(QMainWindow):
     def _on_progress(self, frac, text):
         self.progress.setValue(int(max(0.0, min(1.0, frac)) * 100))
         self.lbl_action.setText(text or "")
+        if self._active_kind == "calibrate":
+            self.calibrate_tab.set_progress(frac, text)
+
+    @Slot(dict)
+    def _on_robot_update(self, payload: dict):
+        self.calibrate_tab.on_robot_update(payload)
 
     @Slot(dict)
     def _on_done(self, payload: dict):
@@ -406,9 +506,15 @@ class MainWindow(QMainWindow):
             self._thread.wait(2000)
         self._thread = None
         self._worker = None
+        kind = payload.get("kind")
         self._busy(False)
+        self._active_kind = None
         self.lbl_action.setText("done")
-        if payload.get("kind") == "sweep":
+        if kind == "calibrate":
+            rep = payload.get("report", {})
+            self.calibrate_tab.on_done(rep)
+            self.summary.setPlainText(render_text(rep))
+        elif payload.get("kind") == "sweep":
             rep = payload.get("report", {})
             txt = render_text(rep)
             probe = payload.get("probe")
@@ -503,11 +609,11 @@ class MainWindow(QMainWindow):
         # pick up the real field size as soon as SSL-Vision sends geometry
         if self.engine.refresh_field_geometry():
             self.field.set_limits(self.engine.lim)
+            self._update_zone_label()
             fi = self.engine.field_info()
             self._append_log(
                 f"[field] updated to {fi['length_mm']:.0f} x {fi['width_mm']:.0f} "
-                f"mm (source: {fi['source']}); arena ±{fi['arena_half_len_mm']:.0f} "
-                f"x ±{fi['arena_half_wid_mm']:.0f} mm")
+                f"mm (source: {fi['source']}); {self.engine.zone_desc()}")
         st = self.engine.source_status()
         v, t = st["vision"], st["telemetry"]
         if v.get("error"):
@@ -543,10 +649,15 @@ class MainWindow(QMainWindow):
             rs = self.engine.telemetry.robot_status(r.is_yellow, r.robot_id)
             self.tbl.item(row, 4).setText("●" if rs.get("seen") else "—")
 
-        # push a fresh snapshot to the Competition + Robots tabs
+        # push a fresh snapshot to the Competition + Robots + Auto-Calibrate tabs
         snapshot = self._collect_snapshot()
         self.overview.update_snapshot(snapshot)
         self.robots_tab.update_snapshot(snapshot)
+        self.calibrate_tab.update_live(snapshot)
+
+        # the Vision Map reads the full live picture (all robots + ball) straight
+        # from the vision stream, so it refreshes itself from the engine
+        self.vision_map_tab.refresh()
 
     def closeEvent(self, ev):
         self._timer.stop()

@@ -44,6 +44,16 @@ class PoseSample:
         return (self.x, self.y, self.o)
 
 
+@dataclass
+class BallSample:
+    x: float                # mm, world frame
+    y: float                # mm
+    confidence: float
+    frame_number: int
+    t_perf: float           # local perf_counter() at receive
+    t_wall: float           # local time.time() at receive
+
+
 class VisionSource:
     """Threaded SSL-vision receiver with per-robot pose + timing stats."""
 
@@ -55,6 +65,7 @@ class VisionSource:
         self._lock = threading.Lock()
 
         self._poses: dict[tuple[bool, int], PoseSample] = {}
+        self._ball: BallSample | None = None       # latest (highest-conf) ball
         self._frames = RateMeter(window=480)
         self._last_frame_no: int | None = None
         self._drops = 0
@@ -166,6 +177,18 @@ class VisionSource:
                         t_capture=t_capture, t_sent=t_sent,
                     )
 
+            # Ball: keep the highest-confidence detection in this frame. Frames
+            # with no ball (e.g. a camera that doesn't currently see it) leave
+            # the last known ball in place — readers expire it via max_age.
+            balls = getattr(det, "balls", None)
+            if balls:
+                best = max(balls, key=lambda b: float(getattr(b, "confidence", 0.0)))
+                self._ball = BallSample(
+                    x=float(best.x), y=float(best.y),
+                    confidence=float(getattr(best, "confidence", 0.0)),
+                    frame_number=frame_no, t_perf=t_perf, t_wall=t_wall,
+                )
+
     # -- readers --
     def get_pose_sample(self, is_yellow: bool, robot_id: int,
                         max_age: float | None = None) -> PoseSample | None:
@@ -181,6 +204,17 @@ class VisionSource:
                  max_age: float | None = None):
         s = self.get_pose_sample(is_yellow, robot_id, max_age)
         return s.pose() if s else None
+
+    def get_ball(self, max_age: float | None = None) -> BallSample | None:
+        """Latest ball vision sees (highest-confidence per frame), or None if no
+        ball has been seen (or the last one is older than `max_age` seconds)."""
+        with self._lock:
+            b = self._ball
+        if b is None:
+            return None
+        if max_age is not None and (time.perf_counter() - b.t_perf) > max_age:
+            return None
+        return b
 
     def visible_robots(self) -> list[tuple[bool, int]]:
         with self._lock:

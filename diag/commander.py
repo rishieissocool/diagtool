@@ -283,11 +283,12 @@ class Commander:
         if self._safety_max_speed > 0 and math.hypot(vx, vy) > self._safety_max_speed:
             return True
         x, y = pose[0], pose[1]
-        for p, v, bound in ((x, vx, lim.arena_half_len), (y, vy, lim.arena_half_wid)):
+        xlo, xhi, ylo, yhi = lim.arena_bounds()
+        for p, v, lo, hi in ((x, vx, xlo, xhi), (y, vy, ylo, yhi)):
             if v > 5.0:
-                room = bound - p
+                room = hi - p
             elif v < -5.0:
-                room = bound + p
+                room = p - lo
             else:
                 continue
             if room <= 0.0 or self._stop_distance(abs(v)) >= room:

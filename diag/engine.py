@@ -25,13 +25,19 @@ import yaml
 from . import bridge, safety
 from .sources import VisionSource, TelemetrySource
 from .commander import Commander
-from .diagnostics import DiagContext, RobotRef, DEFAULTS, BY_NAME, ALL_DIAGNOSTICS
+from .diagnostics import (DiagContext, RobotRef, DEFAULTS, BY_NAME,
+                          ALL_DIAGNOSTICS, CALIBRATION_TESTS)
 from . import calibrator, report
 
 
 DIAGTOOL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = DIAGTOOL_DIR / "output"
 SETTINGS_FILE = DIAGTOOL_DIR / "diag_settings.yaml"
+# The drag-set test zone is persisted to its own small file so the hand-tuned,
+# heavily-commented diag_settings.yaml is never rewritten. Loaded on top of it.
+ZONE_FILE = DIAGTOOL_DIR / "test_zone.yaml"
+ZONE_KEYS = ("test_zone_x_min_mm", "test_zone_x_max_mm",
+             "test_zone_y_min_mm", "test_zone_y_max_mm")
 
 
 @dataclass
@@ -112,6 +118,16 @@ def load_settings() -> dict:
             for k, v in data.items():
                 if k in s and v is not None:
                     s[k] = v
+    except Exception:
+        pass
+    # Overlay the GUI-set test zone (kept in its own file so the commented
+    # settings file is never clobbered). Only applies the four zone keys.
+    try:
+        if ZONE_FILE.is_file():
+            z = yaml.safe_load(ZONE_FILE.read_text(encoding="utf-8")) or {}
+            for k in ZONE_KEYS:
+                if z.get(k) is not None:
+                    s[k] = float(z[k])
     except Exception:
         pass
     return s
@@ -265,7 +281,11 @@ class Engine:
                                                    DEFAULTS["boundary_inset_mm"])),
             brake_zone=float(self.settings.get("brake_zone_mm",
                                                DEFAULTS["brake_zone_mm"])),
-            half_len=half_len, half_wid=half_wid)
+            half_len=half_len, half_wid=half_wid,
+            zone_x_min=self.settings.get("test_zone_x_min_mm"),
+            zone_x_max=self.settings.get("test_zone_x_max_mm"),
+            zone_y_min=self.settings.get("test_zone_y_min_mm"),
+            zone_y_max=self.settings.get("test_zone_y_max_mm"))
 
     def refresh_field_geometry(self) -> bool:
         """Rebuild the arena from the latest field size (vision/settings).
@@ -282,15 +302,94 @@ class Engine:
             return True
         return False
 
+    # -- test zone (the drive arena, optionally restricted by a drag) --
+    def set_test_zone(self, x_min: float, x_max: float,
+                      y_min: float, y_max: float, persist: bool = True) -> safety.Limits:
+        """Restrict testing/driving to a rectangle (world mm) — e.g. half a field.
+
+        The rectangle is clamped to the keep-off-walls safe box inside `Limits`,
+        so it can never push a robot toward a wall. Applies live to the running
+        command stream and (by default) is saved so it survives a restart.
+        """
+        self.settings["test_zone_x_min_mm"] = float(min(x_min, x_max))
+        self.settings["test_zone_x_max_mm"] = float(max(x_min, x_max))
+        self.settings["test_zone_y_min_mm"] = float(min(y_min, y_max))
+        self.settings["test_zone_y_max_mm"] = float(max(y_min, y_max))
+        return self._apply_zone(persist)
+
+    def clear_test_zone(self, persist: bool = True) -> safety.Limits:
+        """Drop any custom test zone — drive the full (symmetric) arena again."""
+        for k in ZONE_KEYS:
+            self.settings[k] = None
+        return self._apply_zone(persist)
+
+    def set_field_half(self, positive: bool, persist: bool = True) -> safety.Limits:
+        """Restrict the drive zone to OUR half of the field (the common comp case:
+        you only get one side). `positive` selects the +x half (goal-to-goal axis),
+        matching ipconfig's `us_positive`.
+
+        The half is the our-side half of the *conservative* drive arena: the
+        wall-facing x edge and both y edges keep the full `boundary_inset` margin
+        (same as the default symmetric arena), while the harmless halfway line
+        stays at x=0. Everything is still clamped to the keep-off-walls safe box,
+        and the commander's brake ramp + predictive emergency stop apply on top —
+        so a robot is kept well off every wall."""
+        inset = float(self.lim.boundary_inset)
+        shl = max(0.0, self.lim.safe_half_len - inset)
+        shw = max(0.0, self.lim.safe_half_wid - inset)
+        if positive:
+            x_min, x_max = 0.0, shl
+        else:
+            x_min, x_max = -shl, 0.0
+        return self.set_test_zone(x_min, x_max, -shw, shw, persist=persist)
+
+    def config_flag(self, name: str, default=None):
+        """Read a top-level flag from ipconfig.yaml (e.g. us_yellow, us_positive)."""
+        return getattr(self.config, name, default)
+
+    def _apply_zone(self, persist: bool) -> safety.Limits:
+        self.lim = self._build_limits()
+        if self.commander is not None:
+            self.commander.set_limits(self.lim)
+        if persist:
+            self._persist_test_zone()
+        return self.lim
+
+    def _persist_test_zone(self) -> None:
+        vals = {k: self.settings.get(k) for k in ZONE_KEYS}
+        try:
+            if all(v is None for v in vals.values()):
+                ZONE_FILE.unlink(missing_ok=True)   # full field -> no override file
+            else:
+                ZONE_FILE.write_text(yaml.safe_dump(vals, sort_keys=False),
+                                     encoding="utf-8")
+        except Exception:
+            pass
+
     def field_info(self) -> dict:
         lim = self.lim
+        xlo, xhi, ylo, yhi = lim.arena_bounds()
         return {
             "length_mm": round(lim.half_len * 2, 1),
             "width_mm": round(lim.half_wid * 2, 1),
             "source": self._field_source,
             "arena_half_len_mm": round(lim.arena_half_len, 1),
             "arena_half_wid_mm": round(lim.arena_half_wid, 1),
+            "zone_custom": lim.has_custom_zone,
+            "zone_x_min_mm": round(xlo, 1),
+            "zone_x_max_mm": round(xhi, 1),
+            "zone_y_min_mm": round(ylo, 1),
+            "zone_y_max_mm": round(yhi, 1),
         }
+
+    def zone_desc(self) -> str:
+        """Human-readable one-liner describing the current drive zone."""
+        lim = self.lim
+        xlo, xhi, ylo, yhi = lim.arena_bounds()
+        if lim.has_custom_zone:
+            return (f"custom test zone x[{xlo:.0f}, {xhi:.0f}] "
+                    f"y[{ylo:.0f}, {yhi:.0f}] mm ({xhi - xlo:.0f} x {yhi - ylo:.0f})")
+        return f"full arena ±{lim.arena_half_len:.0f} x ±{lim.arena_half_wid:.0f} mm"
 
     def probe_robot(self, robot: RobotInfo, seconds: float = 5.0,
                     move_speed: float = 0.0, log=None) -> dict:
@@ -423,6 +522,17 @@ class Engine:
         return {"vision": self.vision.status(),
                 "telemetry": self.telemetry.status()}
 
+    def vision_net_info(self) -> dict:
+        """Where vision is read from on the LAN: the SSL-Vision multicast
+        group/port and the network interface it's bound to (from ipconfig's
+        network.vision_ip; 0.0.0.0 = all interfaces / auto)."""
+        try:
+            group, port = self.config.vision
+        except Exception:
+            group, port = ("224.5.23.2", self.vision.port)
+        iface = getattr(self.config, "vision_ip", None) or "0.0.0.0"
+        return {"group": str(group), "port": int(port), "interface": str(iface)}
+
     def _context(self) -> DiagContext:
         return DiagContext(self.vision, self.telemetry, self.commander,
                            self.settings, self.lim)
@@ -502,3 +612,150 @@ class Engine:
         rep["_paths"] = paths
         log(f"\nReport written:\n  {paths['txt']}\n  {paths['json']}")
         return rep
+
+    # -- auto-calibration (per-robot, sequential, wall-safe) --
+    def run_auto_calibration(self, robots: list[RobotInfo],
+                             tests: list[str] | None = None,
+                             log=None, progress=None, stop=None,
+                             output_dir=None, per_robot_cb=None,
+                             probe_first: bool = True,
+                             meta_extra: dict | None = None) -> dict:
+        """Calibrate every selected robot, one at a time, and write a per-robot
+        report plus one combined report + CSV into a single generated folder.
+
+        Each robot is (optionally) probed first; unreachable robots are SKIPPED
+        (not retried) so a dead robot never stalls the whole battery. Every robot
+        is driven exclusively through the wall-safe Commander inside the current
+        (half-field) test zone, so this can never drive a robot vision can see
+        into a wall. Sequential by design — only ONE robot ever moves at a time.
+
+        per_robot_cb(label, payload) is called as each robot starts / is skipped /
+        finishes, so a UI can fill in a live results table.
+        """
+        log = log or (lambda *_: None)
+        progress = progress or (lambda *_: None)
+        stop = stop or (lambda: False)
+        per_robot_cb = per_robot_cb or (lambda *_: None)
+        tests = list(tests) if tests else list(CALIBRATION_TESTS)
+        if not self._started:
+            self.start()
+
+        out_root = Path(output_dir) if output_dir else (
+            DEFAULT_OUTPUT / ("autocal_" + time.strftime("%Y%m%d_%H%M%S")))
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        log("=" * 64)
+        log(f"AUTO-CALIBRATION — {len(robots)} robot(s) x {len(tests)} test(s)")
+        log(f"  drive zone : {self.zone_desc()}")
+        log(f"  output     : {out_root}")
+        for ip, labels in ip_conflicts(robots).items():
+            log(f"  [!] {ip} is shared by {', '.join(labels)} — give each robot a "
+                "unique IP (Setup tab) or results will be wrong.")
+        log("=" * 64)
+
+        all_results: dict[str, dict] = {}
+        per_robot_paths: dict[str, dict] = {}
+        skipped: list[str] = []
+        n = max(len(robots), 1)
+        for i, r in enumerate(robots):
+            if stop():
+                log("Auto-calibration aborted.")
+                break
+            base, span = i / n, 1.0 / n
+
+            def _p(frac, text="", _b=base, _s=span):
+                progress(_b + _s * max(0.0, min(1.0, frac)), text)
+
+            log(f"\n----- [{i + 1}/{len(robots)}] {r.label}  @ {r.ip}:{r.port} -----")
+            per_robot_cb(r.label, {"status": "running", "ip": r.ip})
+
+            if probe_first:
+                probe = self.probe_robot(r, seconds=2.0, move_speed=0.0, log=log)
+                verdict = probe.get("verdict", "")
+                vision_seen = bool(probe.get("vision_visible"))
+                # Only skip a robot that is DEFINITELY absent: a bad/unroutable IP
+                # (send failed), or nothing answering AND vision can't see it. A
+                # robot vision CAN see is always calibrated even if its telemetry
+                # is silent (telemetry on these robots is a known-flaky 1 Hz, so it
+                # is never trusted as the reachability gate — vision is).
+                definitely_absent = (verdict.startswith("SEND FAILED")
+                                     or (verdict.startswith("SILENT") and not vision_seen))
+                if definitely_absent:
+                    log(f"  [SKIP] {r.label} not reachable (and vision can't see "
+                        "it) — skipping so the battery keeps moving. Fix its "
+                        "IP/power and re-run just it.")
+                    all_results[r.label] = {"_skipped": "unreachable", "_probe": probe}
+                    skipped.append(r.label)
+                    per_robot_cb(r.label, {"status": "skipped", "probe": probe,
+                                           "reason": "unreachable"})
+                    progress((i + 1) / n, f"{r.label} skipped")
+                    continue
+                if not vision_seen:
+                    log(f"  [!] {r.label}: telemetry is silent but proceeding — "
+                        "calibration measures motion from VISION. If vision can't "
+                        "see it either, the tests will report 'not visible'.")
+
+            rep_one = self.run_sweep([r], tests, log=log, progress=_p, stop=stop,
+                                     output_dir=out_root / r.label)
+            res = rep_one.get("results", {}).get(r.label, {})
+            all_results[r.label] = res
+            per_robot_paths[r.label] = rep_one.get("_paths", {})
+            cal_one = (rep_one.get("calibration", {})
+                       .get("robots", {}).get(r.label, {}))
+            per_robot_cb(r.label, {"status": "done", "calibration": cal_one,
+                                   "paths": rep_one.get("_paths", {})})
+            log(f"  [report] {rep_one.get('_paths', {}).get('txt')}")
+            progress((i + 1) / n, f"{r.label} done")
+
+        # combined report across every robot
+        measured = {k: v for k, v in all_results.items() if not v.get("_skipped")}
+        cal = calibrator.build_calibration(measured)
+        st = self.source_status()
+        rep = report.build_report(
+            all_results, cal, st["vision"], st["telemetry"],
+            meta=(meta_extra or {}) | {
+                "robots": [r.label for r in robots],
+                "tests": tests,
+                "ip_conflicts": ip_conflicts(robots),
+                "mode": "auto_calibration",
+                "drive_zone": self.zone_desc(),
+                "skipped": skipped,
+            })
+        paths = report.write_report(out_root, rep)
+        csv_path = self._write_calibration_csv(
+            out_root / "calibration_summary.csv", cal)
+        rep["_paths"] = paths
+        rep["_per_robot_paths"] = per_robot_paths
+        rep["_csv"] = str(csv_path)
+        rep["_output_dir"] = str(out_root)
+        rep["_skipped"] = skipped
+        log("\n" + "=" * 64)
+        log("AUTO-CALIBRATION COMPLETE")
+        if skipped:
+            log(f"  skipped (unreachable): {', '.join(skipped)}")
+        log(f"  combined report : {paths['txt']}")
+        log(f"  summary CSV     : {csv_path}")
+        log(f"  per-robot folders under: {out_root}")
+        log("=" * 64)
+        return rep
+
+    @staticmethod
+    def _write_calibration_csv(path, cal: dict) -> Path:
+        """One row per robot: the calibration values, easy to scan / paste."""
+        import csv
+        path = Path(path)
+        cols = ["robot", "speed_scale", "actual_speed_ms", "w_scale",
+                "lateral_drift_per_m", "heading_drift_deg_per_m",
+                "stop_overshoot_mm", "stop_latency_ms", "command_latency_ms",
+                "rotation_latency_ms", "spin_w_scale", "spin_center_drift_mm",
+                "spin_latency_ms"]
+        robots = cal.get("robots", {})
+        with path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(cols + ["warnings"])
+            for label in sorted(robots):
+                rs = robots[label]
+                row = [label] + [rs.get(c) for c in cols[1:]]
+                row.append(" | ".join(rs.get("warnings", [])))
+                w.writerow(row)
+        return path
