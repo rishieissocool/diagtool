@@ -124,7 +124,6 @@ class SSL_Multicast(Receiver):
             return cfg.vision_ip
         except Exception:
             return "0.0.0.0"
-            return "0.0.0.0"
 
     def _add_group(self):
         """Joins multicast group, trying the configured interface then falling back to INADDR_ANY."""

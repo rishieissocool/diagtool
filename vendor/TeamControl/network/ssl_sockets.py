@@ -127,7 +127,7 @@ if __name__ == "__main__":
     is_running = Event()
     is_running.set()
     
-    vt = VisionTracker(is_running)
+    vt = Vision(is_running)
     while True:
         try:
             if is_running.is_set():

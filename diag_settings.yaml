@@ -62,8 +62,8 @@ poll_s: 0.004            # vision poll period inside loops
 # These explicit values are used as a safe fallback until vision reports it,
 # and as a hard cap (the arena never exceeds the smaller of vision vs these).
 # Set them to YOUR field. Leave blank/remove to rely purely on vision/config.
-field_length_mm: 4500    # x, goal line to goal line
-field_width_mm: 2230     # y, touchline to touchline
+field_length_mm: 9000    # x, goal line to goal line
+field_width_mm: 6000     # y, touchline to touchline
 
 # --- arena / wall safety (make tests stay well away from the walls) ---
 # The drive arena is the field minus the keep-off margin minus this inset.
