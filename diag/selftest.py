@@ -1271,11 +1271,13 @@ class _SimTelemetry:
         }
 
 
-def _run_sim(name: str, speed_scale=1.0, w_scale=1.0) -> dict:
+def _run_sim(name: str, speed_scale=1.0, w_scale=1.0, settings=None,
+            lim=None) -> dict:
     robot = _SimRobot(speed_scale=speed_scale, w_scale=w_scale)
     key = (True, 1)
     ctx = DiagContext(_SimVision(robot, key), _SimTelemetry(key),
-                      _SimCommander(robot, key), _SIM_SETTINGS, _SYNTH_LIM)
+                      _SimCommander(robot, key), settings or _SIM_SETTINGS,
+                      lim or _SYNTH_LIM)
     ref = RobotRef(key[0], key[1], "127.0.0.1", 50514)
     noop = lambda *a, **k: None                        # noqa: E731
     return BY_NAME[name](ctx).run(ref, noop, noop, lambda: False)
@@ -1340,6 +1342,29 @@ def sim_spin_calibration():
     # measured centre drift must be ~0 (this is the calibration's headline metric)
     cd = res["center_drift_mm"]["mean"]
     assert cd is not None and cd < 50.0, f"unexpected spin centre drift {cd} mm"
+
+
+@_test("simulated sweep", tier="sim")
+def sim_speed_shuttle_completes_legs():
+    # _SYNTH_LIM's compact arena only has ~1.6 m of room, so use a shuttle
+    # speed that comfortably fits it (the "real" 1.0 m/s default is checked
+    # against the zone-too-short guard separately, below).
+    settings = dict(_SIM_SETTINGS, shuttle_speed_ms=0.3, shuttle_legs=2)
+    res = _run_sim("speed_shuttle", settings=settings)
+    assert "error" not in res, res.get("error")
+    assert res["legs"] == 2
+    assert res["peak_speed_ms"]["n"] + res["emergency_trip_legs"] == 2
+    if res["peak_speed_ms"]["n"]:
+        assert res["peak_speed_ms"]["mean"] > 0.05, "shuttle barely moved"
+
+
+@_test("simulated sweep", tier="sim")
+def sim_speed_shuttle_refuses_when_zone_too_short():
+    # default shuttle_speed_ms (1.0 m/s) needs far more straight-line room
+    # than _SYNTH_LIM's ~1.6 m compact test arena offers -- must refuse up
+    # front instead of hammering the emergency stop every leg.
+    res = _run_sim("speed_shuttle", settings=_SIM_SETTINGS)
+    assert "error" in res and "too short" in res["error"]
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -274,6 +274,29 @@ class MainWindow(QMainWindow):
             self._test_btns.append(b)
         rl.addWidget(ctrl)
 
+        # -- max-speed shuttle: deliberately NOT in the routine battery above
+        # (or Full Sweep / Auto-Calibrate) since it drives at full commanded
+        # speed, not the other tests' low, safe probe speed. Own button so
+        # it's always a deliberate, one-robot-at-a-time choice.
+        shuttle = QGroupBox("Speed test — max-speed shuttle (side-to-side)")
+        sl = QHBoxLayout(shuttle)
+        btn_shuttle = QPushButton("▶ Run max-speed shuttle")
+        btn_shuttle.setToolTip(
+            "Bounces the selected robot back and forth along the test zone's "
+            "long axis at shuttle_speed_ms (default 1.0 m/s) instead of the "
+            "other tests' low probe speed. Only run once speed_scale ~ 1.0 "
+            "(robot is calibrated). Same arena brake / predictive emergency "
+            "stop protects it regardless of speed.\n\n"
+            "Stopping safely from 1.0 m/s needs ~5.5 m of straight room, more "
+            "than a full field offers from centre in one direction (~3.9 m) -- "
+            "position the robot near one END of the zone first so the shuttle "
+            "has the full length ahead, or it will refuse with 'zone too short'.")
+        btn_shuttle.setStyleSheet("background:#d98c1f; color:white; font-weight:bold;")
+        btn_shuttle.clicked.connect(lambda: self._run_test("speed_shuttle"))
+        sl.addWidget(btn_shuttle)
+        self._test_btns.append(btn_shuttle)
+        rl.addWidget(shuttle)
+
         # -- manual jog: plainly drive the robot a little, to see it move --
         jog = QGroupBox("Manual jog — selected robot · 0.5 s pulse · body frame")
         jg = QGridLayout(jog)

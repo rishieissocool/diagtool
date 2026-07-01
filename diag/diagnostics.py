@@ -55,6 +55,11 @@ DEFAULTS = {
                                 # several x faster than commanded, so keep the
                                 # real speed (and coast) small near walls
     "test_w_rads": 0.20,        # commanded angular speed for rotation test
+    "shuttle_speed_ms": 1.0,    # commanded speed for the max-speed shuttle test
+                                # (m/s) -- much higher than test_speed_ms on
+                                # purpose; only run this once a robot is already
+                                # calibrated (speed_scale ~ 1.0)
+    "shuttle_legs": 6,          # one-way legs per shuttle run (3 round trips)
     "spin_trials": 4,           # pure-spin (in-place rotation) calibration trials
     "spin_w_rads": 0.5,         # commanded angular speed for the spin calibration
                                 # (clamped to MAX_W); higher = cleaner w_scale, but
@@ -877,6 +882,127 @@ class SpinCalibrationDiagnostic(Diagnostic):
         }
 
 
+# ── Max-speed shuttle (continuous side-to-side top-speed run) ─────────────
+
+class SpeedShuttleDiagnostic(Diagnostic):
+    """Continuous max-speed shuttle: bounce the robot back and forth along the
+    test zone's long (goal-to-goal) axis at a much higher commanded speed than
+    the calibration battery uses (shuttle_speed_ms, default 1.0 m/s) -- to see
+    the actual top speed and behaviour under real load instead of the low,
+    deliberately-safe speed_scale probe.
+
+    Same wall-safe pipeline as every other test: velocities go through the
+    Commander with safe=True, so the arena brake/hard-stop and the predictive
+    emergency stop (driven by MEASURED vision velocity, so it adapts to
+    whatever speed the robot is actually reaching, not just what was
+    commanded) still protect it. On top of that each leg reverses on its own,
+    well before the edge, at a buffer scaled from the commanded speed using
+    the same reaction+coast model as the emergency stop -- so a healthy run
+    turns around gracefully and rarely needs the hard stop at all; that's
+    only a backstop for a mis-scaled/misbehaving robot.
+
+    If the test zone is too short for even one clean leg at the requested
+    speed, the run refuses up front rather than hammering the emergency stop
+    every leg -- lower shuttle_speed_ms or widen the test zone.
+    """
+
+    name = "speed_shuttle"
+    title = "Max-speed shuttle (side-to-side)"
+
+    def _turn_buffer_mm(self, speed_ms: float) -> float:
+        """Distance-to-edge at which a leg reverses on its own -- generous vs.
+        the Commander's own emergency-stop margin (_stop_distance) so a
+        healthy robot turns around gracefully instead of relying on it."""
+        speed_mm_s = speed_ms * 1000.0
+        reaction = float(self.s("safety_reaction_s"))
+        decel = max(float(self.s("safety_decel_mm_s2")), 1.0)
+        factor = float(self.s("safety_factor"))
+        coast = (speed_mm_s * speed_mm_s) / (2.0 * decel)
+        return 1.25 * factor * (reaction * speed_mm_s + coast) + float(self.s("stop_buffer_mm"))
+
+    def run(self, robot, log, progress, stop) -> dict:
+        if not self._wait_visible(robot, log):
+            return {"error": "robot not visible"}
+        speed = float(self.s("shuttle_speed_ms"))
+        legs = max(1, int(self.s("shuttle_legs")))
+        turn_buffer = self._turn_buffer_mm(speed)
+        max_leg_s = float(self.s("max_run_s"))
+
+        s0 = self._pose(robot)
+        if s0 is None:
+            return {"error": "robot not visible"}
+        ux, uy, room = self._open_x_dir(s0.pose())
+        min_room = turn_buffer + 300.0
+        if room < min_room:
+            return {"error": f"test zone too short for a {speed:.2f} m/s shuttle "
+                             f"(has {room:.0f} mm of room ahead, needs >= "
+                             f"{min_room:.0f} mm to stop safely from that speed -- "
+                             "position the robot nearer one end of the test zone "
+                             "before starting so it has the full length ahead, "
+                             "or lower shuttle_speed_ms)"}
+
+        log(f"  shuttle: {speed:.2f} m/s x {legs} legs, "
+            f"turn buffer {turn_buffer:.0f} mm, room {room:.0f} mm")
+        peaks, ratios, trip_legs = [], [], 0
+        sign = 1
+        self._reset_cmd_stats(robot)
+        try:
+            for leg in range(legs):
+                self._check(stop)
+                progress(leg / legs, f"leg {leg + 1}/{legs}")
+                lux, luy = ux * sign, uy * sign
+                self.cmd.set_velocity(robot.is_yellow, robot.robot_id,
+                                      vx=lux * speed, vy=luy * speed, w=0.0,
+                                      frame="world", safe=True)
+
+                tr = MotionTracker(0.4)
+                last_fn = None
+                leg_peak = 0.0
+                tripped = False
+                end = time.perf_counter() + max_leg_s
+                while time.perf_counter() < end:
+                    self._check(stop)
+                    s = self._pose(robot)
+                    if s is not None and s.frame_number != last_fn:
+                        last_fn = s.frame_number
+                        tr.add(s.t_perf, s.x, s.y, s.o)
+                        if tr.ready:
+                            leg_peak = max(leg_peak, tr.speed())
+                        if self._room_ahead(s.pose(), lux, luy) < turn_buffer:
+                            break
+                    if self._emergency_seen(robot):
+                        tripped = True
+                        break
+                    time.sleep(self.s("poll_s"))
+                self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+
+                if tripped:
+                    trip_legs += 1
+                    log(f"  leg {leg + 1}: emergency stop tripped -- still "
+                        "accelerating into its own stopping distance; widen "
+                        "the test zone or lower shuttle_speed_ms")
+                else:
+                    ratio = (leg_peak / 1000.0) / speed if speed > 0 else 0.0
+                    peaks.append(leg_peak)
+                    ratios.append(ratio)
+                    log(f"  leg {leg + 1}: peak={leg_peak / 1000.0:.2f} m/s "
+                        f"(cmd={speed:.2f}, ratio={ratio:.2f})")
+                sign = -sign
+                self._settle(robot, log, stop, dur=0.3)
+        finally:
+            self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+            self._settle(robot, log, stop, dur=0.5)
+
+        return {
+            "commanded_speed_ms": speed,
+            "legs": legs,
+            "turn_buffer_mm": round(turn_buffer, 0),
+            "peak_speed_ms": summarize([p / 1000.0 for p in peaks], "m/s"),
+            "speed_ratio": summarize(ratios, ""),
+            "emergency_trip_legs": trip_legs,
+        }
+
+
 # ── Registry ──────────────────────────────────────────────────────────────
 
 ALL_DIAGNOSTICS = [
@@ -888,11 +1014,14 @@ ALL_DIAGNOSTICS = [
     AngularDiagnostic,
 ]
 
-# The spin calibration is available by name (engine.run_diagnostic("spin") and
-# the Auto-Calibrate tab) but deliberately NOT in ALL_DIAGNOSTICS, so the
-# existing Diagnostics-tab battery / Full Sweep / self-test are unchanged.
+# The spin calibration and the max-speed shuttle are available by name
+# (engine.run_diagnostic(...) and their own GUI buttons) but deliberately NOT
+# in ALL_DIAGNOSTICS, so the existing Diagnostics-tab battery / Full Sweep /
+# self-test (and every robot's routine calibration pass) don't silently pick
+# up a full-speed run.
 BY_NAME = {d.name: d for d in ALL_DIAGNOSTICS}
 BY_NAME[SpinCalibrationDiagnostic.name] = SpinCalibrationDiagnostic
+BY_NAME[SpeedShuttleDiagnostic.name] = SpeedShuttleDiagnostic
 
 # Canonical test order for a full per-robot calibration (used by the
 # Auto-Calibrate tab and engine.run_auto_calibration).

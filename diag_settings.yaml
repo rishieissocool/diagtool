@@ -28,6 +28,18 @@ vel_window_s: 0.22       # window for the instantaneous velocity estimate
 test_speed_ms: 0.12      # linear speed for latency/stop/speed tests (m/s)
 test_w_rads: 0.20        # angular speed for the rotation test (rad/s)
 
+# --- max-speed shuttle (side-to-side, own GUI button; NOT in the routine
+# battery/Full Sweep, and NOT part of Auto-Calibrate). Bounces the robot back
+# and forth along the test zone's long axis at full commanded speed to see
+# real top speed/behaviour. Only run this once a robot is calibrated
+# (speed_scale ~ 1.0 from the normal speed_scale test) -- unlike the other
+# tests' deliberately-slow commands, this one is meant to run fast. Each leg
+# still turns around on its own well before the wall (scaled from
+# shuttle_speed_ms using the safety_* model below), and the same predictive
+# emergency stop backs it up regardless of the requested speed.
+shuttle_speed_ms: 1.0    # commanded shuttle speed (m/s)
+shuttle_legs: 6          # one-way legs per run (3 round trips)
+
 # --- repetitions ---
 latency_trials: 6
 stop_trials: 5
