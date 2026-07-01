@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..engine import Engine
-from ..diagnostics import ALL_DIAGNOSTICS
+from ..diagnostics import ALL_DIAGNOSTICS, MOTION_TESTS, BY_NAME
 from ..report import render_text
 from .field_view import FieldView
 from .overview_tab import OverviewTab
@@ -274,28 +274,46 @@ class MainWindow(QMainWindow):
             self._test_btns.append(b)
         rl.addWidget(ctrl)
 
-        # -- max-speed shuttle: deliberately NOT in the routine battery above
-        # (or Full Sweep / Auto-Calibrate) since it drives at full commanded
-        # speed, not the other tests' low, safe probe speed. Own button so
-        # it's always a deliberate, one-robot-at-a-time choice.
-        shuttle = QGroupBox("Speed test — max-speed shuttle (side-to-side)")
-        sl = QHBoxLayout(shuttle)
-        btn_shuttle = QPushButton("▶ Run max-speed shuttle")
-        btn_shuttle.setToolTip(
-            "Bounces the selected robot back and forth along the test zone's "
-            "long axis at shuttle_speed_ms (default 1.0 m/s) instead of the "
-            "other tests' low probe speed. Only run once speed_scale ~ 1.0 "
-            "(robot is calibrated). Same arena brake / predictive emergency "
-            "stop protects it regardless of speed.\n\n"
-            "Stopping safely from 1.0 m/s needs ~5.5 m of straight room, more "
-            "than a full field offers from centre in one direction (~3.9 m) -- "
-            "position the robot near one END of the zone first so the shuttle "
-            "has the full length ahead, or it will refuse with 'zone too short'.")
-        btn_shuttle.setStyleSheet("background:#d98c1f; color:white; font-weight:bold;")
-        btn_shuttle.clicked.connect(lambda: self._run_test("speed_shuttle"))
-        sl.addWidget(btn_shuttle)
-        self._test_btns.append(btn_shuttle)
-        rl.addWidget(shuttle)
+        # -- high-speed / motion tests: deliberately NOT in the routine battery
+        # above (or Full Sweep / Auto-Calibrate) since they drive the robot
+        # FORWARD at full commanded speed, not the other tests' low, safe probe
+        # speed. Own buttons so each is always a deliberate, one-robot choice.
+        motion = QGroupBox("High-speed & motion tests — faces forward · run only "
+                           "when calibrated (speed_scale ≈ 1.0)")
+        mg = QGridLayout(motion)
+        _MOTION_TIPS = {
+            "speed_shuttle":
+                "Bounces the robot back and forth along the zone's long axis, "
+                "rotating to face each direction then driving forward at "
+                "shuttle_speed_ms (default 1.0 m/s). Needs ~5.5 m of straight "
+                "room to stop from 1.0 m/s — position the robot near one END of "
+                "the zone first, or it refuses with 'zone too short'.",
+            "straight_line":
+                "Drives forward in a straight line and measures how far it "
+                "wanders off the line (lateral deviation) and its heading drift.",
+            "accel_profile":
+                "Blasts from rest to accel_speed_ms and measures how fast it "
+                "gets up to speed (time/distance to 50% and 90%, peak accel).",
+            "heading_hold":
+                "Rotates in place to each target heading and measures settle "
+                "time, overshoot, and steady-state error. Pure rotation.",
+            "waypoint":
+                "Drives to a point and stops on it, there and back — measures "
+                "final position error, overshoot, and settle time.",
+        }
+        for i, name in enumerate(MOTION_TESTS):
+            cls = BY_NAME.get(name)
+            if cls is None:
+                continue
+            b = QPushButton(f"▶ {cls.title}")
+            b.setToolTip(_MOTION_TIPS.get(name, cls.title)
+                         + "\n\nSame arena brake + predictive emergency stop "
+                           "protects the robot regardless of speed.")
+            b.setStyleSheet("background:#d98c1f; color:white; font-weight:bold;")
+            b.clicked.connect(lambda _=False, n=name: self._run_test(n))
+            mg.addWidget(b, i // 2, i % 2)
+            self._test_btns.append(b)
+        rl.addWidget(motion)
 
         # -- manual jog: plainly drive the robot a little, to see it move --
         jog = QGroupBox("Manual jog — selected robot · 0.5 s pulse · body frame")

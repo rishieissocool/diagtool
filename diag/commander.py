@@ -145,6 +145,15 @@ class Commander:
         Takes effect on the next send."""
         self._lim = lim
 
+    def set_send_hz(self, hz: float) -> None:
+        """Change the command stream rate live (e.g. a high-speed motion test
+        raises it so heading correction is smooth rather than stepwise). Takes
+        effect on the next loop tick."""
+        self._period = 1.0 / max(1.0, float(hz))
+
+    def get_send_hz(self) -> float:
+        return 1.0 / self._period if self._period > 0 else 0.0
+
     def set_grsim_addr(self, addr: tuple[str, int] | None) -> None:
         """Point the grSim command path at a new (ip, port) (e.g. after reload)."""
         self._grsim_addr = (str(addr[0]), int(addr[1])) if addr else None

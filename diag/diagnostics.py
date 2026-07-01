@@ -55,11 +55,33 @@ DEFAULTS = {
                                 # several x faster than commanded, so keep the
                                 # real speed (and coast) small near walls
     "test_w_rads": 0.20,        # commanded angular speed for rotation test
+    # --- high-speed / motion tests (face-forward, closed-loop heading) ---
+    # These drive the robot FORWARD (body +x) toward its heading rather than
+    # omni-strafing in world frame, so it points the way it's going and can run
+    # at full speed. Commands are streamed closed-loop every poll tick (not set
+    # once), and the stream rate is raised to fast_send_hz for the duration so
+    # the motion is smooth, not stepwise. Only run these once a robot is
+    # calibrated (speed_scale ~ 1.0).
+    "fast_send_hz": 120.0,      # command stream rate during motion tests (Hz)
+    "heading_kp": 3.5,          # yaw gain: rad/s of turn per rad of heading error
+    "heading_tol_rad": 0.087,   # ~5 deg: "facing the target" once within this
+    "face_speed_gate_rad": 0.35,# above this heading error, ease off forward speed
+                                # (cos-taper) so the robot tracks its line instead
+                                # of veering while it is still turning to face
     "shuttle_speed_ms": 1.0,    # commanded speed for the max-speed shuttle test
                                 # (m/s) -- much higher than test_speed_ms on
                                 # purpose; only run this once a robot is already
                                 # calibrated (speed_scale ~ 1.0)
     "shuttle_legs": 6,          # one-way legs per shuttle run (3 round trips)
+    "straight_line_speed_ms": 0.6,  # speed for the straight-line tracking test
+    "straight_line_trials": 4,      # runs (alternating direction)
+    "accel_speed_ms": 1.0,          # target speed for the acceleration profile
+    "accel_trials": 3,              # acceleration-profile runs
+    "heading_targets_deg": [90.0, 180.0, -90.0, 0.0],  # heading-step test targets
+    "heading_hold_s": 0.6,          # steady-hold window after each heading step
+    "waypoint_speed_ms": 0.6,       # cruise speed for the go-to-point test
+    "waypoint_tol_mm": 60.0,        # "arrived" radius for the go-to-point test
+    "waypoint_cycles": 2,           # there-and-back cycles for the go-to-point test
     "spin_trials": 4,           # pure-spin (in-place rotation) calibration trials
     "spin_w_rads": 0.5,         # commanded angular speed for the spin calibration
                                 # (clamped to MAX_W); higher = cleaner w_scale, but
@@ -331,6 +353,75 @@ class Diagnostic:
                     return s, True
             time.sleep(poll)
         return self._pose(robot), False
+
+    # -- closed-loop heading / forward-drive helpers (motion tests) -----------
+    #
+    # The routine calibration tests set a world-frame velocity once and let the
+    # Commander stream it. The high-speed motion tests instead POINT the robot
+    # the way it is going and drive it FORWARD (body +x), re-issuing the command
+    # every poll tick so heading is corrected continuously (smooth, not
+    # stepwise) — and they raise the stream rate for the duration.
+
+    def _boost_send_rate(self):
+        """Raise the command stream rate for a fast test; return a restore fn.
+
+        No-op on stand-in commanders that don't expose the setter (e.g. the
+        self-test's fake), so callers can always use it in a try/finally.
+        """
+        setter = getattr(self.cmd, "set_send_hz", None)
+        getter = getattr(self.cmd, "get_send_hz", None)
+        if not setter or not getter:
+            return lambda: None
+        prev = getter()
+        setter(float(self.s("fast_send_hz")))
+        return lambda: setter(prev)
+
+    def _steer_forward(self, pose, ux, uy, speed):
+        """Body-frame (vx_forward, w) that yaws the robot to FACE world dir
+        (ux, uy) and drives forward at `speed`.
+
+        The forward speed is cos-tapered while the heading error is large (past
+        face_speed_gate_rad) so the robot tracks its intended line instead of
+        launching off at an angle before it has finished turning to face it.
+        Returns (vx_forward, w, heading_err_rad).
+        """
+        o = pose[2]
+        err = _ang_diff(math.atan2(uy, ux), o)
+        w = safety.clamp(float(self.s("heading_kp")) * err,
+                         -self.lim.max_w, self.lim.max_w)
+        gate = float(self.s("face_speed_gate_rad"))
+        aim = 1.0 if abs(err) <= gate else max(0.0, math.cos(err))
+        return speed * aim, w, err
+
+    def _drive_forward_body(self, robot, vx_forward, w):
+        """Stream one forward (body +x) command with yaw. Safe pipeline on."""
+        self.cmd.set_velocity(robot.is_yellow, robot.robot_id,
+                              vx=vx_forward, vy=0.0, w=w,
+                              frame="body", safe=True)
+
+    def _rotate_to_heading(self, robot, target_o, stop, timeout=3.0):
+        """Spin in place until facing world heading `target_o` (within
+        heading_tol_rad) or timeout. Wall-safe (pure rotation). Returns
+        (reached_bool, final_heading_err_rad)."""
+        tol = float(self.s("heading_tol_rad"))
+        kp = float(self.s("heading_kp"))
+        end = time.perf_counter() + timeout
+        err = math.pi
+        while time.perf_counter() < end:
+            self._check(stop)
+            s = self._pose(robot)
+            if s is not None:
+                err = _ang_diff(target_o, s.o)
+                if abs(err) <= tol:
+                    self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+                    return True, err
+                w = safety.clamp(kp * err, -self.lim.max_w, self.lim.max_w)
+                self.cmd.set_velocity(robot.is_yellow, robot.robot_id,
+                                      vx=0.0, vy=0.0, w=w,
+                                      frame="world", safe=True)
+            time.sleep(self.s("poll_s"))
+        self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+        return False, err
 
 
 # ── Vision health ─────────────────────────────────────────────────────────
@@ -891,6 +982,13 @@ class SpeedShuttleDiagnostic(Diagnostic):
     the actual top speed and behaviour under real load instead of the low,
     deliberately-safe speed_scale probe.
 
+    The robot FACES the way it is going: at each turnaround it rotates to point
+    down the new direction and then drives FORWARD (body +x) at full speed,
+    which is how a real robot moves fastest and most stably. The forward
+    command is streamed closed-loop every poll tick (heading corrected
+    continuously, so it stays smooth rather than stepwise) and the command
+    stream rate is raised to fast_send_hz for the duration.
+
     Same wall-safe pipeline as every other test: velocities go through the
     Commander with safe=True, so the arena brake/hard-stop and the predictive
     emergency stop (driven by MEASURED vision velocity, so it adapts to
@@ -907,7 +1005,7 @@ class SpeedShuttleDiagnostic(Diagnostic):
     """
 
     name = "speed_shuttle"
-    title = "Max-speed shuttle (side-to-side)"
+    title = "Max-speed shuttle (faces forward)"
 
     def _turn_buffer_mm(self, speed_ms: float) -> float:
         """Distance-to-edge at which a leg reverses on its own -- generous vs.
@@ -941,35 +1039,42 @@ class SpeedShuttleDiagnostic(Diagnostic):
                              "before starting so it has the full length ahead, "
                              "or lower shuttle_speed_ms)"}
 
-        log(f"  shuttle: {speed:.2f} m/s x {legs} legs, "
+        log(f"  shuttle: {speed:.2f} m/s x {legs} legs (faces forward), "
             f"turn buffer {turn_buffer:.0f} mm, room {room:.0f} mm")
-        peaks, ratios, trip_legs = [], [], 0
+        peaks, ratios, heading_errs, trip_legs = [], [], [], 0
         sign = 1
         self._reset_cmd_stats(robot)
+        restore_rate = self._boost_send_rate()
         try:
             for leg in range(legs):
                 self._check(stop)
                 progress(leg / legs, f"leg {leg + 1}/{legs}")
                 lux, luy = ux * sign, uy * sign
-                self.cmd.set_velocity(robot.is_yellow, robot.robot_id,
-                                      vx=lux * speed, vy=luy * speed, w=0.0,
-                                      frame="world", safe=True)
+                # 1) point the robot down the leg before blasting off
+                self._rotate_to_heading(robot, math.atan2(luy, lux), stop,
+                                        timeout=2.5)
 
+                # 2) closed-loop forward drive, re-issued every tick
                 tr = MotionTracker(0.4)
                 last_fn = None
                 leg_peak = 0.0
+                leg_head_err = 0.0
                 tripped = False
                 end = time.perf_counter() + max_leg_s
                 while time.perf_counter() < end:
                     self._check(stop)
                     s = self._pose(robot)
-                    if s is not None and s.frame_number != last_fn:
-                        last_fn = s.frame_number
-                        tr.add(s.t_perf, s.x, s.y, s.o)
-                        if tr.ready:
-                            leg_peak = max(leg_peak, tr.speed())
-                        if self._room_ahead(s.pose(), lux, luy) < turn_buffer:
-                            break
+                    if s is not None:
+                        if s.frame_number != last_fn:
+                            last_fn = s.frame_number
+                            tr.add(s.t_perf, s.x, s.y, s.o)
+                            if tr.ready:
+                                leg_peak = max(leg_peak, tr.speed())
+                            if self._room_ahead(s.pose(), lux, luy) < turn_buffer:
+                                break
+                        vx_f, w, herr = self._steer_forward(s.pose(), lux, luy, speed)
+                        leg_head_err = max(leg_head_err, abs(herr))
+                        self._drive_forward_body(robot, vx_f, w)
                     if self._emergency_seen(robot):
                         tripped = True
                         break
@@ -985,11 +1090,14 @@ class SpeedShuttleDiagnostic(Diagnostic):
                     ratio = (leg_peak / 1000.0) / speed if speed > 0 else 0.0
                     peaks.append(leg_peak)
                     ratios.append(ratio)
+                    heading_errs.append(math.degrees(leg_head_err))
                     log(f"  leg {leg + 1}: peak={leg_peak / 1000.0:.2f} m/s "
-                        f"(cmd={speed:.2f}, ratio={ratio:.2f})")
+                        f"(cmd={speed:.2f}, ratio={ratio:.2f}) "
+                        f"max_heading_err={math.degrees(leg_head_err):.1f} deg")
                 sign = -sign
                 self._settle(robot, log, stop, dur=0.3)
         finally:
+            restore_rate()
             self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
             self._settle(robot, log, stop, dur=0.5)
 
@@ -999,8 +1107,419 @@ class SpeedShuttleDiagnostic(Diagnostic):
             "turn_buffer_mm": round(turn_buffer, 0),
             "peak_speed_ms": summarize([p / 1000.0 for p in peaks], "m/s"),
             "speed_ratio": summarize(ratios, ""),
+            "max_heading_err_deg": summarize(heading_errs, "deg"),
             "emergency_trip_legs": trip_legs,
         }
+
+
+# ── Straight-line tracking (facing forward) ───────────────────────────────
+
+class StraightLineDiagnostic(Diagnostic):
+    """Drive the robot FORWARD in a straight line and measure how straight it
+    actually goes: lateral deviation off the intended line and heading drift.
+
+    Points the robot down the open axis, then drives forward (body +x) at
+    straight_line_speed with closed-loop heading, sampling the path. The
+    lateral deviation of each sample is its perpendicular distance from the
+    ideal straight line through the start point along the intended heading;
+    we report peak and RMS deviation per run plus heading drift. Wall-safe
+    (arena guard + emergency stop as always)."""
+
+    name = "straight_line"
+    title = "Straight-line tracking (facing forward)"
+
+    def run(self, robot, log, progress, stop) -> dict:
+        if not self._wait_visible(robot, log):
+            return {"error": "robot not visible"}
+        speed = float(self.s("straight_line_speed_ms"))
+        trials = max(1, int(self.s("straight_line_trials")))
+        buffer_mm = float(self.s("stop_buffer_mm")) + 400.0
+        max_run_s = float(self.s("max_run_s"))
+        max_travel = float(self.s("max_travel_mm"))
+
+        peak_dev, rms_dev, head_drift, lengths = [], [], [], []
+        sign = 1
+        restore_rate = self._boost_send_rate()
+        try:
+            for i in range(trials):
+                self._check(stop)
+                progress(i / trials, f"run {i + 1}/{trials}")
+                self._settle(robot, log, stop)
+                s0 = self._pose(robot)
+                if s0 is None:
+                    continue
+                ux, uy, room = self._open_x_dir(s0.pose())
+                ux, uy = ux * sign, uy * sign
+                if self._room_ahead(s0.pose(), ux, uy) < buffer_mm + 200.0:
+                    sign = -sign
+                    ux, uy = -ux, -uy
+                heading = math.atan2(uy, ux)
+                self._rotate_to_heading(robot, heading, stop, timeout=2.5)
+
+                s_start = self._pose(robot)
+                if s_start is None:
+                    continue
+                p0 = (s_start.x, s_start.y)
+                devs = []
+                max_abs_dev = 0.0
+                max_head = 0.0
+                end = time.perf_counter() + max_run_s
+                while time.perf_counter() < end:
+                    self._check(stop)
+                    s = self._pose(robot)
+                    if s is not None:
+                        dx, dy = s.x - p0[0], s.y - p0[1]
+                        along = dx * ux + dy * uy
+                        perp = dx * (-uy) + dy * ux        # signed lateral offset
+                        devs.append(perp)
+                        max_abs_dev = max(max_abs_dev, abs(perp))
+                        max_head = max(max_head, abs(_ang_diff(s.o, heading)))
+                        if along >= max_travel or \
+                                self._room_ahead(s.pose(), ux, uy) < buffer_mm:
+                            break
+                        vx_f, w, _ = self._steer_forward(s.pose(), ux, uy, speed)
+                        self._drive_forward_body(robot, vx_f, w)
+                    if self._emergency_seen(robot):
+                        break
+                    time.sleep(self.s("poll_s"))
+                self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+
+                s_end = self._pose(robot)
+                length = 0.0
+                if s_end is not None:
+                    length = (s_end.x - p0[0]) * ux + (s_end.y - p0[1]) * uy
+                if devs and length > 100.0:
+                    rms = math.sqrt(sum(d * d for d in devs) / len(devs))
+                    peak_dev.append(max_abs_dev)
+                    rms_dev.append(rms)
+                    head_drift.append(math.degrees(max_head))
+                    lengths.append(length)
+                    log(f"  run {i + 1}: length={length:.0f} mm  peak_dev="
+                        f"{max_abs_dev:.1f} mm  rms_dev={rms:.1f} mm  "
+                        f"heading_drift={math.degrees(max_head):.1f} deg")
+                else:
+                    log(f"  run {i + 1}: too little motion, skipped")
+                sign = -sign
+                self._settle(robot, log, stop, dur=0.3)
+        finally:
+            restore_rate()
+            self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+            self._settle(robot, log, stop, dur=0.5)
+
+        return {
+            "commanded_speed_ms": speed,
+            "trials": trials,
+            "run_length_mm": summarize(lengths, "mm"),
+            "peak_lateral_dev_mm": summarize(peak_dev, "mm"),
+            "rms_lateral_dev_mm": summarize(rms_dev, "mm"),
+            "heading_drift_deg": summarize(head_drift, "deg"),
+        }
+
+
+# ── Acceleration profile (0 -> target speed) ──────────────────────────────
+
+class AccelProfileDiagnostic(Diagnostic):
+    """Measure how quickly the robot gets up to speed. Faces forward, commands
+    accel_speed from rest, and records the time and distance to reach fractions
+    of the commanded speed plus the peak acceleration. Wall-safe."""
+
+    name = "accel_profile"
+    title = "Acceleration profile (0 -> target)"
+
+    def run(self, robot, log, progress, stop) -> dict:
+        if not self._wait_visible(robot, log):
+            return {"error": "robot not visible"}
+        speed = float(self.s("accel_speed_ms"))
+        trials = max(1, int(self.s("accel_trials")))
+        target_mm_s = speed * 1000.0
+        buffer_mm = float(self.s("stop_buffer_mm")) + 400.0
+        max_run_s = float(self.s("max_run_s"))
+        max_travel = float(self.s("max_travel_mm"))
+        fracs = (0.5, 0.9)
+
+        t50, t90, d90, peak_acc, reached = [], [], [], [], 0
+        sign = 1
+        restore_rate = self._boost_send_rate()
+        try:
+            for i in range(trials):
+                self._check(stop)
+                progress(i / trials, f"run {i + 1}/{trials}")
+                self._settle(robot, log, stop)
+                s0 = self._pose(robot)
+                if s0 is None:
+                    continue
+                ux, uy, room = self._open_x_dir(s0.pose())
+                ux, uy = ux * sign, uy * sign
+                if self._room_ahead(s0.pose(), ux, uy) < buffer_mm + 200.0:
+                    sign = -sign
+                    ux, uy = -ux, -uy
+                heading = math.atan2(uy, ux)
+                self._rotate_to_heading(robot, heading, stop, timeout=2.5)
+
+                s_start = self._pose(robot)
+                if s_start is None:
+                    continue
+                p0 = (s_start.x, s_start.y)
+                t0 = time.perf_counter()
+                tr = MotionTracker(0.2)
+                last_fn = None
+                prev_v = 0.0
+                prev_t = t0
+                hit = {0.5: None, 0.9: None}
+                trial_peak_acc = 0.0
+                end = t0 + max_run_s
+                while time.perf_counter() < end:
+                    self._check(stop)
+                    s = self._pose(robot)
+                    if s is not None:
+                        if s.frame_number != last_fn:
+                            last_fn = s.frame_number
+                            tr.add(s.t_perf, s.x, s.y, s.o)
+                            if tr.ready:
+                                v = tr.speed()
+                                now = s.t_perf
+                                if now > prev_t:
+                                    acc = (v - prev_v) / (now - prev_t)
+                                    trial_peak_acc = max(trial_peak_acc, acc)
+                                prev_v, prev_t = v, now
+                                for f in fracs:
+                                    if hit[f] is None and v >= f * target_mm_s:
+                                        hit[f] = (now - t0,
+                                                  math.hypot(s.x - p0[0], s.y - p0[1]))
+                            dist = math.hypot(s.x - p0[0], s.y - p0[1])
+                            if hit[0.9] is not None or dist >= max_travel or \
+                                    self._room_ahead(s.pose(), ux, uy) < buffer_mm:
+                                break
+                        vx_f, w, _ = self._steer_forward(s.pose(), ux, uy, speed)
+                        self._drive_forward_body(robot, vx_f, w)
+                    if self._emergency_seen(robot):
+                        break
+                    time.sleep(self.s("poll_s"))
+                self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+
+                if hit[0.5] is not None:
+                    t50.append(hit[0.5][0] * 1000.0)
+                if hit[0.9] is not None:
+                    reached += 1
+                    t90.append(hit[0.9][0] * 1000.0)
+                    d90.append(hit[0.9][1])
+                if trial_peak_acc > 0:
+                    peak_acc.append(trial_peak_acc)
+                log(f"  run {i + 1}: t50={_ms(hit[0.5])}  t90={_ms(hit[0.9])}  "
+                    f"peak_acc={trial_peak_acc / 1000.0:.2f} m/s^2")
+                sign = -sign
+                self._settle(robot, log, stop, dur=0.3)
+        finally:
+            restore_rate()
+            self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+            self._settle(robot, log, stop, dur=0.5)
+
+        return {
+            "commanded_speed_ms": speed,
+            "trials": trials,
+            "reached_90pct": reached,
+            "t_to_50pct_ms": summarize(t50, "ms"),
+            "t_to_90pct_ms": summarize(t90, "ms"),
+            "dist_to_90pct_mm": summarize(d90, "mm"),
+            "peak_accel_ms2": summarize([a / 1000.0 for a in peak_acc], "m/s^2"),
+        }
+
+
+# ── Heading step response (rotate & hold) ─────────────────────────────────
+
+class HeadingHoldDiagnostic(Diagnostic):
+    """Step the robot's heading to a sequence of target angles and measure how
+    fast and cleanly it gets there: settle time, overshoot, and steady-state
+    error over a hold window. Pure in-place rotation, so it is inherently
+    wall-safe. Targets are world headings (deg) from heading_targets_deg."""
+
+    name = "heading_hold"
+    title = "Heading step response (rotate & hold)"
+
+    def run(self, robot, log, progress, stop) -> dict:
+        if not self._wait_visible(robot, log):
+            return {"error": "robot not visible"}
+        targets = list(self.s("heading_targets_deg"))
+        tol = float(self.s("heading_tol_rad"))
+        kp = float(self.s("heading_kp"))
+        hold_s = float(self.s("heading_hold_s"))
+
+        settle_ms, overshoot_deg, steady_deg, missed = [], [], [], 0
+        restore_rate = self._boost_send_rate()
+        try:
+            for i, tdeg in enumerate(targets):
+                self._check(stop)
+                progress(i / max(1, len(targets)), f"target {i + 1}/{len(targets)}")
+                target_o = math.radians(float(tdeg))
+                self._settle(robot, log, stop, dur=0.3)
+
+                s0 = self._pose(robot)
+                if s0 is None:
+                    missed += 1
+                    log(f"  target {tdeg:.0f} deg: robot not visible")
+                    continue
+                # sign of the initial error = the direction we're rotating; an
+                # overshoot is the robot swinging PAST the target (opposite sign)
+                approach = 1.0 if _ang_diff(target_o, s0.o) >= 0 else -1.0
+
+                t0 = time.perf_counter()
+                settled_at = None
+                peak_past = 0.0
+                hold_errs = []
+                # one continuous loop: rotate toward the target, note when it
+                # first enters the tolerance band (settle time), keep holding for
+                # hold_s while recording steady error, and track the furthest it
+                # swings beyond the target (overshoot) throughout.
+                end = t0 + max(2.5, float(self.s("max_run_s"))) + hold_s
+                while time.perf_counter() < end:
+                    self._check(stop)
+                    s = self._pose(robot)
+                    if s is not None:
+                        err = _ang_diff(target_o, s.o)
+                        peak_past = max(peak_past, -err * approach)
+                        if settled_at is None and abs(err) <= tol:
+                            settled_at = time.perf_counter() - t0
+                        if settled_at is not None:
+                            hold_errs.append(abs(err))
+                            if (time.perf_counter() - t0) - settled_at >= hold_s:
+                                break
+                        w = safety.clamp(kp * err, -self.lim.max_w, self.lim.max_w)
+                        self.cmd.set_velocity(robot.is_yellow, robot.robot_id,
+                                              vx=0.0, vy=0.0, w=w,
+                                              frame="world", safe=True)
+                    time.sleep(self.s("poll_s"))
+                self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+
+                if settled_at is None:
+                    missed += 1
+                    log(f"  target {tdeg:.0f} deg: did NOT settle within timeout")
+                    continue
+                settle = settled_at * 1000.0
+                over = math.degrees(max(0.0, peak_past))
+                steady = math.degrees(sum(hold_errs) / len(hold_errs)) \
+                    if hold_errs else 0.0
+                settle_ms.append(settle)
+                overshoot_deg.append(over)
+                steady_deg.append(steady)
+                log(f"  target {tdeg:.0f} deg: settle={settle:.0f} ms  "
+                    f"overshoot={over:.1f} deg  steady_err={steady:.2f} deg")
+        finally:
+            restore_rate()
+            self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+
+        return {
+            "targets_deg": targets,
+            "settle_ms": summarize(settle_ms, "ms"),
+            "overshoot_deg": summarize(overshoot_deg, "deg"),
+            "steady_error_deg": summarize(steady_deg, "deg"),
+            "missed_targets": missed,
+        }
+
+
+# ── Go-to-point (position control) ────────────────────────────────────────
+
+class WaypointDiagnostic(Diagnostic):
+    """Drive the robot to a point and stop on it, there and back. Measures how
+    accurately it arrives: final position error, overshoot past the target, and
+    settle time. Faces forward while cruising and eases off as it nears the
+    target (proportional approach). Wall-safe."""
+
+    name = "waypoint"
+    title = "Go-to-point (position control)"
+
+    def run(self, robot, log, progress, stop) -> dict:
+        if not self._wait_visible(robot, log):
+            return {"error": "robot not visible"}
+        speed = float(self.s("waypoint_speed_ms"))
+        tol = float(self.s("waypoint_tol_mm"))
+        cycles = max(1, int(self.s("waypoint_cycles")))
+        max_run_s = float(self.s("max_run_s"))
+
+        s0 = self._pose(robot)
+        if s0 is None:
+            return {"error": "robot not visible"}
+        # two points along the long axis, inside the arena with margin
+        xlo, xhi, ylo, yhi = self.lim.arena_bounds()
+        cy = self.lim.arena_cy
+        margin = float(self.s("stop_buffer_mm")) + 300.0
+        ax = xlo + margin
+        bx = xhi - margin
+        if bx - ax < 400.0:
+            return {"error": "test zone too short for a go-to-point run "
+                             "(need ~1 m of length) -- widen the test zone"}
+        pa, pb = (ax, cy), (bx, cy)
+        log(f"  waypoints A=({pa[0]:.0f},{pa[1]:.0f}) B=({pb[0]:.0f},{pb[1]:.0f})  "
+            f"tol={tol:.0f} mm")
+
+        final_err, overshoot, settle_ms, misses = [], [], [], 0
+        restore_rate = self._boost_send_rate()
+        try:
+            legs = [pb, pa] * cycles
+            for i, target in enumerate(legs):
+                self._check(stop)
+                progress(i / len(legs), f"leg {i + 1}/{len(legs)}")
+                t0 = time.perf_counter()
+                arrived_at = None
+                min_dist = 1e9
+                closed_in = False
+                end = t0 + max_run_s
+                while time.perf_counter() < end:
+                    self._check(stop)
+                    s = self._pose(robot)
+                    if s is not None:
+                        dx, dy = target[0] - s.x, target[1] - s.y
+                        dist = math.hypot(dx, dy)
+                        min_dist = min(min_dist, dist)
+                        if dist <= tol:
+                            arrived_at = time.perf_counter()
+                            break
+                        if dist <= 2 * tol:
+                            closed_in = True
+                        ux, uy = dx / dist, dy / dist
+                        # ease off within ~1.5 * (stopping room) of the target
+                        approach = min(1.0, dist / max(200.0, 3.0 * tol))
+                        vx_f, w, _ = self._steer_forward(
+                            s.pose(), ux, uy, speed * approach)
+                        self._drive_forward_body(robot, vx_f, w)
+                    if self._emergency_seen(robot):
+                        break
+                    time.sleep(self.s("poll_s"))
+                self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+
+                # let it coast/settle briefly, then read the final error
+                self._settle(robot, log, stop, dur=0.4)
+                s_end = self._pose(robot)
+                if s_end is not None:
+                    ferr = math.hypot(target[0] - s_end.x, target[1] - s_end.y)
+                    final_err.append(ferr)
+                    # overshoot = how far the closest approach undershot vs how
+                    # far the final rest is past target (settle wobble)
+                    overshoot.append(max(0.0, ferr - min_dist))
+                    if arrived_at is not None:
+                        settle_ms.append((arrived_at - t0) * 1000.0)
+                    else:
+                        misses += 1
+                    tag = "" if arrived_at is not None else "  [did not reach tol]"
+                    log(f"  leg {i + 1}: final_err={ferr:.1f} mm  "
+                        f"closest={min_dist:.1f} mm{tag}")
+        finally:
+            restore_rate()
+            self.cmd.stop_robot(robot.is_yellow, robot.robot_id)
+            self._settle(robot, log, stop, dur=0.4)
+
+        return {
+            "waypoint_a": [round(pa[0], 0), round(pa[1], 0)],
+            "waypoint_b": [round(pb[0], 0), round(pb[1], 0)],
+            "tolerance_mm": tol,
+            "final_error_mm": summarize(final_err, "mm"),
+            "overshoot_mm": summarize(overshoot, "mm"),
+            "settle_ms": summarize(settle_ms, "ms"),
+            "missed_legs": misses,
+        }
+
+
+def _ms(hit) -> str:
+    return "—" if hit is None else f"{hit[0] * 1000.0:.0f} ms"
 
 
 # ── Registry ──────────────────────────────────────────────────────────────
@@ -1014,14 +1533,25 @@ ALL_DIAGNOSTICS = [
     AngularDiagnostic,
 ]
 
-# The spin calibration and the max-speed shuttle are available by name
-# (engine.run_diagnostic(...) and their own GUI buttons) but deliberately NOT
-# in ALL_DIAGNOSTICS, so the existing Diagnostics-tab battery / Full Sweep /
-# self-test (and every robot's routine calibration pass) don't silently pick
-# up a full-speed run.
+# High-speed / motion tests. Deliberately NOT in ALL_DIAGNOSTICS, so the
+# routine Diagnostics-tab battery / Full Sweep / self-test / per-robot
+# calibration never silently pick up a full-speed, face-forward run. Exposed by
+# name (engine.run_diagnostic(...)) and via their own GUI buttons.
+MOTION_DIAGNOSTICS = [
+    StraightLineDiagnostic,
+    SpeedShuttleDiagnostic,
+    AccelProfileDiagnostic,
+    HeadingHoldDiagnostic,
+    WaypointDiagnostic,
+]
+
+# Ordered list of motion-test names for the GUI (title looked up via BY_NAME).
+MOTION_TESTS = [d.name for d in MOTION_DIAGNOSTICS]
+
 BY_NAME = {d.name: d for d in ALL_DIAGNOSTICS}
 BY_NAME[SpinCalibrationDiagnostic.name] = SpinCalibrationDiagnostic
-BY_NAME[SpeedShuttleDiagnostic.name] = SpeedShuttleDiagnostic
+for _d in MOTION_DIAGNOSTICS:
+    BY_NAME[_d.name] = _d
 
 # Canonical test order for a full per-robot calibration (used by the
 # Auto-Calibrate tab and engine.run_auto_calibration).

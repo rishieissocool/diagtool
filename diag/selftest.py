@@ -520,6 +520,26 @@ def open_direction_and_room_follow_custom_zone():
     assert approx(diag._room_ahead((805.0, 0.0, 0.0), 1.0, 0.0), 1610.0 - 805.0)
 
 
+@_test("diagnostics-math")
+def steer_forward_faces_travel_direction():
+    ctx = DiagContext(None, None, None, {}, _SYNTH_LIM)
+    diag = BY_NAME["straight_line"](ctx)
+    # already facing +x, target +x -> full forward speed, no yaw
+    vx, w, err = diag._steer_forward((0.0, 0.0, 0.0), 1.0, 0.0, 0.5)
+    assert approx(vx, 0.5) and approx(w, 0.0, 1e-9) and approx(err, 0.0)
+    # facing +x, target is +y (90 deg to the left) -> yaw CCW (w>0) and the
+    # forward speed is gated ~to zero so it turns to face before launching off
+    vx, w, err = diag._steer_forward((0.0, 0.0, 0.0), 0.0, 1.0, 0.5)
+    assert w > 0.0 and approx(err, math.pi / 2, 1e-6) and vx < 0.01
+    # facing +x, target -x (behind) -> yaw at the clamp, no forward creep
+    vx, w, err = diag._steer_forward((0.0, 0.0, 0.0), -1.0, 0.0, 0.5)
+    assert approx(abs(w), _SYNTH_LIM.max_w) and vx < 0.01
+    # a small heading error (within the gate) still drives at full speed
+    vx, w, err = diag._steer_forward(
+        (0.0, 0.0, 0.0), math.cos(0.2), math.sin(0.2), 0.5)
+    assert approx(vx, 0.5) and w > 0.0 and approx(err, 0.2, 1e-6)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 5. safety — pure (synthetic limits, no TeamControl) ...
 # ══════════════════════════════════════════════════════════════════════════
@@ -729,6 +749,21 @@ def default_mode_for_grsim_vs_real():
     assert default_mode_for("127.0.0.1") == "grsim"
     assert default_mode_for("localhost") == "grsim"
     assert default_mode_for("192.168.1.7") == "real"
+
+
+@_test("config/engine")
+def motion_tests_registered_but_not_in_routine_battery():
+    from .diagnostics import MOTION_TESTS, ALL_DIAGNOSTICS
+    routine = {d.name for d in ALL_DIAGNOSTICS}
+    assert MOTION_TESTS, "no motion tests registered"
+    for name in MOTION_TESTS:
+        assert name in BY_NAME, f"{name} not resolvable by name"
+        # the whole point: high-speed/face-forward runs must NEVER be swept up
+        # by the routine battery / Full Sweep / Auto-Calibrate
+        assert name not in routine, f"{name} leaked into the routine battery"
+    # the headline ones the user asked for are present
+    assert "speed_shuttle" in MOTION_TESTS
+    assert "straight_line" in MOTION_TESTS
 
 
 @_test("config/engine")
@@ -1004,6 +1039,35 @@ def commander_counts_send_errors():
 
 
 @_test("commander")
+def commander_set_send_hz_round_trips():
+    cmd, rec = _make_commander(_PoseVision(_fresh_pose()))
+    cmd.set_send_hz(120.0)
+    assert approx(cmd.get_send_hz(), 120.0, 1e-6)
+    cmd.set_send_hz(50.0)
+    assert approx(cmd.get_send_hz(), 50.0, 1e-6)
+    # never divides by zero / goes non-positive on a silly value
+    cmd.set_send_hz(0.0)
+    assert cmd.get_send_hz() > 0.0
+
+
+@_test("commander")
+def commander_body_frame_rotates_into_world():
+    # facing +90 deg, a body-forward command must come out as world +y
+    now = time.perf_counter()
+    facing_y = PoseSample(x=0.0, y=0.0, o=math.pi / 2, confidence=1.0,
+                          frame_number=1, t_perf=now, t_wall=time.time(),
+                          t_capture=time.time(), t_sent=time.time())
+    cmd, rec = _make_commander(_PoseVision(facing_y))
+    cmd.register(True, 1, "127.0.0.1", 50514)
+    cmd.set_velocity(True, 1, vx=0.30, vy=0.0, w=0.0, frame="body", safe=True)
+    cmd._send_one(cmd._targets[(True, 1)])
+    st = cmd.stats(True, 1)
+    # body +x forward, rotated by the robot's own heading, arrives as body-frame
+    # velocity whose magnitude is preserved (~0.30) and non-zero
+    assert math.hypot(st["last_sent"][0], st["last_sent"][1]) > 0.1
+
+
+@_test("commander")
 def commander_set_limits_retightens_arena():
     # when vision reports a smaller field, new limits must bound driving at once
     cmd, rec = _make_commander(_PoseVision(_fresh_pose()))
@@ -1127,6 +1191,12 @@ _SIM_SETTINGS.update({
     "moving_mm_s": 80.0, "stopped_mm_s": 40.0,
     "test_speed_ms": 0.30, "test_w_rads": 0.25,
     "spin_trials": 2, "spin_w_rads": 0.5, "spin_seconds": 0.3,
+    # motion tests — shrunk trials/speeds so the sim sweep stays quick
+    "fast_send_hz": 150.0, "heading_kp": 3.5, "heading_tol_rad": 0.09,
+    "straight_line_speed_ms": 0.30, "straight_line_trials": 2,
+    "accel_speed_ms": 0.30, "accel_trials": 2,
+    "heading_targets_deg": [60.0, -60.0], "heading_hold_s": 0.15,
+    "waypoint_speed_ms": 0.30, "waypoint_tol_mm": 90.0, "waypoint_cycles": 1,
 })
 
 
@@ -1146,8 +1216,16 @@ class _SimRobot:
         self.ang_acc = 12.0                       # rad/s^2
 
     def set_cmd(self, vx, vy, w):
+        # The command-latency clock restarts only on a *substantial* command
+        # change (a genuinely new maneuver). Minor closed-loop tweaks (heading
+        # correction, speed taper) re-issued every tick keep the clock running,
+        # so continuous re-commanding doesn't perpetually re-delay motion — a
+        # real robot acts on the latest packet, it doesn't reset its motor
+        # spin-up every time the same command is resent.
+        if (abs(vx - self.cmd[0]) > 0.15 or abs(vy - self.cmd[1]) > 0.15 or
+                abs(w - self.cmd[2]) > 0.30):
+            self.cmd_t = time.perf_counter()
         self.cmd = (vx, vy, w)
-        self.cmd_t = time.perf_counter()
 
     @staticmethod
     def _approach(cur, target, dv):
@@ -1218,6 +1296,7 @@ class _SimCommander:
         self.robot = robot
         self.key = key
         self._last_sent = (0.0, 0.0, 0.0)
+        self._hz = 100.0
 
     def register(self, *a, **k):
         pass
@@ -1225,12 +1304,28 @@ class _SimCommander:
     def enable(self, *a, **k):
         pass
 
+    def set_send_hz(self, hz):
+        self._hz = max(1.0, float(hz))
+
+    def get_send_hz(self):
+        return self._hz
+
     def set_velocity(self, is_yellow, robot_id, vx=0.0, vy=0.0, w=0.0,
                      frame="world", kick=0, dribble=0, safe=True):
         if (bool(is_yellow), int(robot_id)) != self.key:
             return
-        self.robot.set_cmd(float(vx), float(vy), float(w))
-        self._last_sent = (float(vx), float(vy), float(w))
+        vx, vy, w = float(vx), float(vy), float(w)
+        # Mirror the real Commander: a body-frame command is rotated into world
+        # by the robot's current orientation before it drives the model, so the
+        # face-forward motion tests behave the same way here as on a real robot.
+        if frame == "body":
+            o = self.robot.o
+            wx = vx * math.cos(o) - vy * math.sin(o)
+            wy = vx * math.sin(o) + vy * math.cos(o)
+        else:
+            wx, wy = vx, vy
+        self.robot.set_cmd(wx, wy, w)
+        self._last_sent = (wx, wy, w)
 
     def stop_robot(self, is_yellow, robot_id):
         self.set_velocity(is_yellow, robot_id, 0.0, 0.0, 0.0)
@@ -1243,7 +1338,8 @@ class _SimCommander:
 
     def stats(self, is_yellow, robot_id):
         return {"sends": 0, "send_errors": 0, "zeroed_no_pose": 0,
-                "zeroed_safety": 0, "last_sent": self._last_sent}
+                "zeroed_safety": 0, "zeroed_emergency": 0,
+                "last_sent": self._last_sent}
 
     def reset_stats(self, is_yellow, robot_id):
         pass
@@ -1365,6 +1461,54 @@ def sim_speed_shuttle_refuses_when_zone_too_short():
     # front instead of hammering the emergency stop every leg.
     res = _run_sim("speed_shuttle", settings=_SIM_SETTINGS)
     assert "error" in res and "too short" in res["error"]
+
+
+@_test("simulated sweep", tier="sim")
+def sim_straight_line_tracks_the_line():
+    res = _run_sim("straight_line")
+    assert "error" not in res, res.get("error")
+    assert res["trials"] == 2
+    assert res["run_length_mm"]["n"] >= 1, "robot never made a usable run"
+    # the noiseless sim, facing forward, should stay essentially on the line
+    if res["peak_lateral_dev_mm"]["n"]:
+        assert res["peak_lateral_dev_mm"]["mean"] < 200.0, \
+            res["peak_lateral_dev_mm"]
+
+
+@_test("simulated sweep", tier="sim")
+def sim_accel_profile_reaches_speed():
+    res = _run_sim("accel_profile")
+    assert "error" not in res, res.get("error")
+    assert res["trials"] == 2
+    assert res["t_to_50pct_ms"]["n"] >= 1, "never reached half speed"
+    assert res["reached_90pct"] >= 1, "never reached 90% of commanded speed"
+    assert res["peak_accel_ms2"]["n"] >= 1
+
+
+@_test("simulated sweep", tier="sim")
+def sim_heading_hold_settles_on_targets():
+    res = _run_sim("heading_hold")
+    assert "error" not in res, res.get("error")
+    assert res["missed_targets"] == 0, "did not settle on every heading target"
+    assert res["settle_ms"]["n"] == 2
+    # noiseless sim holds heading tightly once settled
+    if res["steady_error_deg"]["n"]:
+        assert res["steady_error_deg"]["mean"] < 8.0, res["steady_error_deg"]
+
+
+@_test("simulated sweep", tier="sim")
+def sim_waypoint_arrives_on_point():
+    # a compact arena + generous time so the there-and-back (incl. a 180 turn
+    # on the return leg) completes inside the sim.
+    lim = safety.Limits(max_speed=1.0, max_w=1.8, half_len=1140.0, half_wid=1140.0,
+                        robot_radius=90.0, field_margin=300.0)
+    settings = dict(_SIM_SETTINGS, max_run_s=4.0, waypoint_speed_ms=0.4,
+                    waypoint_tol_mm=90.0, waypoint_cycles=1)
+    res = _run_sim("waypoint", settings=settings, lim=lim)
+    assert "error" not in res, res.get("error")
+    assert res["final_error_mm"]["n"] >= 1, "no leg produced a reading"
+    # noiseless sim should arrive close to the point
+    assert res["final_error_mm"]["mean"] < 250.0, res["final_error_mm"]
 
 
 # ══════════════════════════════════════════════════════════════════════════

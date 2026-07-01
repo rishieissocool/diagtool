@@ -3,7 +3,11 @@
 # you set here overrides them. Units noted per key.
 
 # --- command streaming ---
-send_hz: 50.0            # how fast DiagTool streams commands to a robot (Hz)
+send_hz: 100.0          # how fast DiagTool streams commands to a robot (Hz).
+                        # Robots read on a ~20 ms (50 Hz) loop, so streaming at
+                        # 100 Hz keeps the command they read <10 ms old (lower
+                        # latency, smoother motion). Motion tests raise this
+                        # again to fast_send_hz for the duration.
 pose_max_age_s: 0.30     # ignore vision poses older than this when driving
 drive_grace_s: 0.5       # keep driving on the last good pose this long after
                          # vision goes stale (bridges brief dropouts instead of
@@ -28,17 +32,41 @@ vel_window_s: 0.22       # window for the instantaneous velocity estimate
 test_speed_ms: 0.12      # linear speed for latency/stop/speed tests (m/s)
 test_w_rads: 0.20        # angular speed for the rotation test (rad/s)
 
-# --- max-speed shuttle (side-to-side, own GUI button; NOT in the routine
-# battery/Full Sweep, and NOT part of Auto-Calibrate). Bounces the robot back
-# and forth along the test zone's long axis at full commanded speed to see
-# real top speed/behaviour. Only run this once a robot is calibrated
-# (speed_scale ~ 1.0 from the normal speed_scale test) -- unlike the other
-# tests' deliberately-slow commands, this one is meant to run fast. Each leg
-# still turns around on its own well before the wall (scaled from
-# shuttle_speed_ms using the safety_* model below), and the same predictive
-# emergency stop backs it up regardless of the requested speed.
+# --- high-speed / motion tests (own GUI buttons; NOT in the routine battery,
+# Full Sweep, or Auto-Calibrate). These POINT the robot the way it is going and
+# drive it FORWARD (body +x) at speed, correcting heading closed-loop every
+# tick, so it faces front and stays smooth. Only run them once a robot is
+# calibrated (speed_scale ~ 1.0). Every one still goes through the same
+# wall-safe pipeline: arena brake/hard-stop + the predictive emergency stop
+# (on MEASURED vision velocity) regardless of the requested speed.
+fast_send_hz: 120.0      # command stream rate while a motion test runs (Hz)
+heading_kp: 3.5          # yaw gain (rad/s of turn per rad of heading error)
+heading_tol_rad: 0.087   # ~5 deg: "facing the target" once within this
+face_speed_gate_rad: 0.35  # ease off forward speed above this heading error so
+                           # the robot tracks its line instead of veering while
+                           # still turning to face the way it's going
+
+# max-speed shuttle: bounces back and forth along the zone's long axis, facing
+# forward each leg. Turns around on its own well before the wall.
 shuttle_speed_ms: 1.0    # commanded shuttle speed (m/s)
 shuttle_legs: 6          # one-way legs per run (3 round trips)
+
+# straight-line tracking: drive forward, measure lateral deviation off the line
+straight_line_speed_ms: 0.6
+straight_line_trials: 4
+
+# acceleration profile: 0 -> target, time/distance to reach 50%/90% of speed
+accel_speed_ms: 1.0
+accel_trials: 3
+
+# heading step response: rotate in place to each target, measure settle/overshoot
+heading_targets_deg: [90.0, 180.0, -90.0, 0.0]
+heading_hold_s: 0.6      # steady-hold window after each heading step (s)
+
+# go-to-point: drive to a point and stop on it, there and back
+waypoint_speed_ms: 0.6
+waypoint_tol_mm: 60.0    # "arrived" radius
+waypoint_cycles: 2       # there-and-back cycles
 
 # --- repetitions ---
 latency_trials: 6
